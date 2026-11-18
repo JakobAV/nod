@@ -206,6 +206,8 @@ import {
 } from './thread.ts';
 import type { VaultActivityReason } from '../shared/contracts.ts';
 import { createTriage, getPreferences } from './triage.ts';
+import { createPush, pushPrivateKey } from './push.ts';
+import { createWebPush } from '../providers/web-push.ts';
 import { createTasks } from './tasks.ts';
 import { createActivity } from './activity.ts';
 import { checkedKeyStore, createVault, credentialOrigin, sealedDataExists } from './vault.ts';
@@ -2959,6 +2961,13 @@ async function initializeApplication(
   onboardingProfile.registerRoutes(app);
   tasks.registerRoutes(app);
   triage.registerRoutes(app);
+  const push = await createPush(
+    createWebPush({
+      privateKey: await pushPrivateKey(),
+      subject: publicOrigin.startsWith('https:') ? publicOrigin : 'mailto:push@nod.invalid',
+    }),
+  );
+  push.registerRoutes(app);
   let channelSettings: Awaited<ReturnType<typeof createChannelSettings>> | undefined;
   let lastChannelObservation: { consentVersion: number; signature: string } | undefined;
   if (options.channels !== false && (adapters.messaging || adapters.messagingSetup)) {

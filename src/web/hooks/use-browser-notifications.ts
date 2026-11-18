@@ -6,6 +6,7 @@ import {
   browserNotificationStatus,
   deliverBrowserNotification,
   subscribeBrowserNotifications,
+  syncBrowserPush,
   watchBrowserNotificationFocus,
 } from '../lib/browser-notifications';
 import { desktopSettingsAvailable } from '../lib/desktop';
@@ -22,6 +23,7 @@ export function useBrowserNotifications(ownerId: string, state: AppState | null)
       initialized: false,
       epoch: sessionStore.getSnapshot().epoch,
       consent: browserNotificationStatus(ownerId),
+      pushSynced: false,
       consentGeneration: 0,
       pending: undefined as Message | undefined,
       seen: new Set<string>(),
@@ -45,6 +47,17 @@ export function useBrowserNotifications(ownerId: string, state: AppState | null)
           scope.consentGeneration++;
         scope.pending = undefined;
         clear();
+      }
+      if (!consent.enabled) scope.pushSynced = false;
+      else if (!scope.pushSynced) {
+        scope.pushSynced = true;
+        void syncBrowserPush(() => browserNotificationStatus(ownerId).enabled)
+          .then((registered) => {
+            if (!registered) scope.pushSynced = false;
+          })
+          .catch(() => {
+            scope.pushSynced = false;
+          });
       }
       scope.consent = consent;
     });
