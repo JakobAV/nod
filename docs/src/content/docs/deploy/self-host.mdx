@@ -162,6 +162,10 @@ The app's local assistant is separate. Connecting does not migrate its data. To 
 
 Model and app connections run on the server too. Use addresses the server can reach; `localhost` inside a Docker installation refers to its server container, not the device running the client. For ChatGPT subscription sign-in, follow the [remote callback instructions](/connect/models/#connect-a-service).
 
+## Install Nod from the browser
+
+Over HTTPS, or at `http://localhost:4310`, your browser can install Nod in its own window. On a phone, this adds Nod to the home screen. In Chrome or Edge, choose **Install** in the address bar or browser menu. On an iPhone or iPad, choose **Share** > **Add to Home Screen** in Safari. On Android, the installed app's system bars follow the device's light or dark setting, not Nod's own theme choice.
+
 ## Connect apps on the server
 
 Open **Apps** and select **Connect**. For apps connected through Composio, Nod opens a sign-in page at your configured `NOD_PUBLIC_URL`. Select **Continue to sign in** and finish authorization in the window it opens. Keep the first page open until the connection finishes. Allow popups for Nod if your browser blocks the sign-in window.
