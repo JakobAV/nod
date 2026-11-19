@@ -3,21 +3,33 @@ import assert from 'node:assert/strict';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import fs from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { syncBuiltinESMExports } from 'node:module';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import pg from 'pg';
+import { z } from 'zod';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import type { MemoryCurator } from '../src/ports/memory-curator.ts';
-import type { AgentToolResult } from '../src/ports/agent.ts';
+import type { AgentToolResult, AgentSessionOptions } from '../src/ports/agent.ts';
 import type { MessagingTransport } from '../src/ports/messaging.ts';
 import type { IntegrationBackoff } from '../src/ports/integrations.ts';
 import { createIntegrationFixture } from '../scripts/e2e-fixtures.ts';
 import { fakeComputer, fakeWorkspace } from './runtime-fixtures.ts';
 import { accessCookie, accessKey } from '../src/server/access.ts';
 import { createDecisionModel } from '../src/providers/decisions.ts';
-import { BrowserActionError, type Computer, type CredentialInput } from '../src/ports/computer.ts';
+import {
+  BrowserActionError,
+  type BrowserAction,
+  type BrowserPage,
+  type Computer,
+  type CredentialInput,
+} from '../src/ports/computer.ts';
 import { authenticatorKey } from '../src/shared/authenticator-key.ts';
 import { authenticatorCode } from '../src/server/authenticator.ts';
 import { transaction } from '../src/server/transaction.ts';
@@ -25,6 +37,7 @@ import { createChannels } from '../src/server/channels.ts';
 import type { AppState, Task } from '../src/shared/contracts.ts';
 import type { WorkUsageResponse } from '../src/shared/models.ts';
 import { mergeMessages } from '../src/web/lib/chat-messages.ts';
+import { ApprovalCard, ApprovalChoiceCard } from '../src/web/components/action-card.tsx';
 
 function syntheticConfirmation(input: Record<string, unknown>) {
   const data = input.data as {
@@ -89,7 +102,7 @@ function syntheticConfirmation(input: Record<string, unknown>) {
 
 test(
   'personal approvals revalidate targets before execution',
-  { skip: !process.env.TEST_DATABASE_URL, timeout: 120_000 },
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 180_000 },
   async (t) => {
     const suffix = randomUUID().replaceAll('-', '').slice(0, 16);
     const schema = `test_personal_review_${suffix}`;
@@ -150,19 +163,41 @@ test(
     let checkCost: number | undefined;
     const connectionLabels: unknown[] = [];
     let confirmationValid = true;
+    let confirmationModel: ((input: Record<string, unknown>) => unknown) | undefined;
+    let httpReview: ((input: Record<string, unknown>) => Promise<unknown>) | undefined;
+    let heldReview:
+      | {
+          purpose?: string;
+          entered(signal?: AbortSignal): void;
+          release: Promise<void>;
+        }
+      | undefined;
     const decisionInputs: Array<{ name: string; input: Record<string, any> }> = [];
     const fallbackChecks: object[] = [];
     const smallReplies: object[] = [];
     const executedApps: string[] = [];
     const draftReadArgs: Array<Record<string, unknown>> = [];
+    const workspaceDispatches: string[] = [];
+    let workspaceReview: ((input: object) => Promise<unknown>) | undefined;
     const uploads: string[] = [];
+    let uploadFailure: Error | undefined;
+    let uploadAttempts = 0;
     const workspaceFiles = new Map<string, Uint8Array>();
     const browserActs: Array<Record<string, unknown>> = [];
     const injected: CredentialInput[] = [];
+    const filledCards: object[] = [];
+    let privateEntryWait:
+      | {
+          entered(signal?: AbortSignal): void;
+          release: Promise<void>;
+        }
+      | undefined;
     let browserUrl = 'https://bank.example.test/transfer';
+    let browserOrigin = 'https://bank.example.test';
     let browserControls = [{ role: 'button', name: 'Authorize payment' }];
     let calendarBrowser: Pick<Computer, 'act' | 'currentPage'> | undefined;
     let calendarReview: ((input: object) => unknown) | undefined;
+    let browserWording: ((input: Record<string, any>) => unknown) | undefined;
     let allowMethodBrowser = false;
     let methodBindings = 0;
     let dialogOpen = false;
@@ -174,12 +209,20 @@ test(
     let appOutage = false;
     let connectionWait: IntegrationBackoff | undefined;
     let appSessions = 0;
+    let unoffered: string | undefined;
     let appResult: unknown;
     let changeRulesOnDraftRead = false;
     let changedRulesDuringDraftRead = 0;
-    let repeatAfterConfirm:
-      { tool?: string; action: string; args: Record<string, unknown> } | undefined;
+    let repeatAfterConfirm: FixtureCall | FixtureCall[] | undefined;
+    let questionAfterConfirm: string | undefined;
+    let repeatDecision: 'new' | 'same' | 'uncertain' = 'same';
+    let holdRepeatCheck: (() => Promise<void>) | undefined;
+    let parallelRepeatWork: ((options: AgentSessionOptions) => Promise<void>) | undefined;
+    let workflowUpdate: { workflowId: string; threshold: number } | undefined;
+    const repeatChecks: Record<string, unknown>[] = [];
     const prompts = new Map<string, string>();
+    const runtimeCommands = new Map<string, AgentSessionOptions['runTool']>();
+    const advertisedMcp = new Map<string, string>();
     const opened: Array<{ turnId: string; model?: string; helper: boolean }> = [];
     const integrationFixture = createIntegrationFixture(`http://localhost:${port}`);
     const { createModelService } = await import('../src/server/models.ts');
@@ -205,9 +248,39 @@ test(
     const fixtureCurator: MemoryCurator = {
       id: 'fixture',
       configured: true,
-      curate: async ({ task, input }, _signal, report) => {
+      curate: async ({ task, input, instructions }, _signal, report) => {
+        if (task === 'review' && heldReview?.purpose === Object(input).purpose && heldReview) {
+          const held = heldReview;
+          held.entered(_signal);
+          await held.release;
+          _signal?.throwIfAborted();
+        }
+        if (
+          browserWording &&
+          'purpose' in input &&
+          ['confirmation', 'confirmation_review'].includes(String(input.purpose)) &&
+          Object(Object(input).data).action === 'NOD_browser'
+        )
+          return browserWording(input as Record<string, any>);
+        if (
+          confirmationModel &&
+          'purpose' in input &&
+          ['confirmation', 'confirmation_review'].includes(String(input.purpose))
+        )
+          return confirmationModel(input as Record<string, unknown>);
+        if (task === 'review' && 'reply' in input && 'question' in input && 'args' in input) {
+          assert.match(instructions, /"probability"/);
+          repeatChecks.push(input);
+          await holdRepeatCheck?.();
+          return { repeatedAction: repeatDecision, probability: 1 };
+        }
         if ('purpose' in input && input.purpose === 'connection' && connectionLabels.length)
           return connectionLabels.shift();
+        if ('purpose' in input && input.purpose === 'payment')
+          return {
+            text: 'Approve the synthetic payment with the private code.',
+            action: 'Approve payment',
+          };
         if ('purpose' in input && input.purpose === 'confirmation_review')
           return confirmationValid
             ? { valid: true }
@@ -219,11 +292,25 @@ test(
           fallbackChecks.push(input);
         if (
           task === 'review' &&
+          httpReview &&
+          'action' in input &&
+          Object(input.action).name === 'CONNECTED_HTTP'
+        )
+          return httpReview(input as Record<string, unknown>);
+        if (
+          task === 'review' &&
           calendarReview &&
           'action' in input &&
           Object(input.action).name === 'NOD_browser'
         )
           return calendarReview(input);
+        if (
+          task === 'review' &&
+          workspaceReview &&
+          'action' in input &&
+          Object(input.action).name === 'NOD_workspace_command'
+        )
+          return workspaceReview(input);
         if (task === 'review' && 'reply' in input) {
           smallReplies.push(input);
           report?.({
@@ -298,6 +385,9 @@ test(
         models,
         agent: {
           async open(options) {
+            runtimeCommands.set(options.turnId, options.runTool);
+            for (const tool of options.tools)
+              if (tool.name.startsWith('mcp__')) advertisedMcp.set(tool.name, tool.description);
             opened.push({
               turnId: options.turnId,
               model: options.model?.modelId,
@@ -329,15 +419,37 @@ test(
               async prompt(text) {
                 prompts.set(options.turnId, text);
                 const tool = (name: string) => options.tools.find((item) => item.name === name)!;
-                if (repeatAfterConfirm && text.includes('executed once by the trusted worker')) {
-                  const call = repeatAfterConfirm;
+                if (
+                  repeatAfterConfirm &&
+                  (text.includes('executed once by the trusted worker') ||
+                    text.includes('confirmed failed or was interrupted') ||
+                    text.includes('confirmed did not run, so nothing was done'))
+                ) {
+                  const calls = repeatAfterConfirm;
                   repeatAfterConfirm = undefined;
-                  results.set(
-                    options.turnId,
-                    await tool(call.tool ?? 'apps').execute(
-                      call.tool === 'files' ? { action: call.action, ...call.args } : call,
-                    ),
-                  );
+                  for (const call of Array.isArray(calls) ? calls : [calls]) {
+                    const name =
+                      call.tool === 'synthetic_mcp'
+                        ? options.tools.find((item) => item.name.endsWith('__execute_workflow'))!
+                            .name
+                        : (call.tool ?? 'apps');
+                    results.set(
+                      options.turnId,
+                      await tool(name).execute(
+                        call.tool === 'synthetic_mcp'
+                          ? call.args
+                          : call.tool === 'files' || call.tool === 'sign_in'
+                            ? { action: call.action, ...call.args }
+                            : call,
+                      ),
+                    );
+                  }
+                  if (!questionAfterConfirm) return;
+                }
+                if (questionAfterConfirm && text.includes('executed once by the trusted worker')) {
+                  const question = questionAfterConfirm;
+                  questionAfterConfirm = undefined;
+                  await tool('ask_user').execute({ question });
                   return;
                 }
                 const part = parts.get(
@@ -401,22 +513,57 @@ test(
                     : undefined;
                 const plan = instruction === undefined ? undefined : plans.get(instruction);
                 if (plan && instruction !== undefined) {
-                  const result = await activePlan.run(instruction, () =>
+                  if (plan.tool === 'bash') {
+                    const result = await options
+                      .runTool('bash', plan.args, async () => {
+                        workspaceDispatches.push(String(plan.args.command));
+                        return {
+                          content: [{ type: 'text', text: 'Synthetic workspace output' }],
+                          exitCode: 0,
+                        };
+                      })
+                      .catch((error: Error) => ({
+                        content: [
+                          { type: 'text' as const, text: JSON.stringify({ error: error.message }) },
+                        ],
+                      }));
+                    results.set(options.turnId, result);
+                    return;
+                  }
+
+                  if (plan.tool === 'synthetic_mcp' && workflowUpdate) {
+                    const update = workflowUpdate;
+                    workflowUpdate = undefined;
+                    await options.tools
+                      .find((item) => item.name.endsWith('__update_workflow'))!
+                      .execute(update);
+                  }
+                  const name =
+                    plan.tool === 'synthetic_mcp'
+                      ? options.tools.find((item) => item.name.endsWith('__execute_workflow'))!.name
+                      : (plan.tool ?? 'manage_personal_context');
+                  const pending = activePlan.run(instruction, () =>
                     options.tools
-                      .find((tool) => tool.name === (plan.tool ?? 'manage_personal_context'))!
+                      .find((tool) => tool.name === name)!
                       .execute(
-                        plan.tool === 'send_message'
-                          ? plan.args
-                          : plan.tool === 'read_source'
-                            ? { input: plan.args }
-                            : plan.tool === 'browser' ||
-                                plan.tool === 'sign_in' ||
-                                plan.tool === 'files' ||
-                                plan.tool === 'task'
-                              ? { action: plan.action, ...plan.args }
-                              : { action: plan.action, args: plan.args },
+                        plan.tool?.startsWith('mcp__')
+                          ? (plan.args.input as Record<string, unknown>)
+                          : plan.tool === 'synthetic_mcp' ||
+                              plan.tool === 'send_message' ||
+                              plan.tool === 'pay'
+                            ? plan.args
+                            : plan.tool === 'read_source'
+                              ? { input: plan.args }
+                              : plan.tool === 'browser' ||
+                                  plan.tool === 'sign_in' ||
+                                  plan.tool === 'files' ||
+                                  plan.tool === 'task'
+                                ? { action: plan.action, ...plan.args }
+                                : { action: plan.action, args: plan.args },
                       ),
                   );
+                  await parallelRepeatWork?.(options);
+                  const result = await pending;
                   results.set(options.turnId, result);
                   return;
                 }
@@ -452,7 +599,34 @@ test(
           selectSignInMethod: async () => {
             throw new Error('This fixture never selects a method.');
           },
-          injectCredentials: async (input) => {
+          checkoutImage: async () =>
+            Buffer.from(
+              'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=',
+              'base64',
+            ),
+          cardDestinations: async () => ({
+            document: 'synthetic-card-document',
+            destinations: {
+              number: 'https://bank.example.test',
+              expiry: 'https://bank.example.test',
+            },
+          }),
+          fillCard: async (input, signal) => {
+            const held = privateEntryWait;
+            if (held) {
+              held.entered(signal);
+              await held.release;
+              signal?.throwIfAborted();
+            }
+            filledCards.push(input);
+          },
+          injectCredentials: async (input, signal) => {
+            const held = privateEntryWait;
+            if (held) {
+              held.entered(signal);
+              await held.release;
+              signal?.throwIfAborted();
+            }
             injected.push(input);
             return { status: 'submitted' };
           },
@@ -475,7 +649,7 @@ test(
             if (dialogOpen && step?.action !== 'accept_dialog')
               throw new Error('A JavaScript dialog blocks the page.');
             return {
-              origin: 'https://bank.example.test',
+              origin: browserOrigin,
               url: browserUrl,
               ...(step?.action === 'accept_dialog'
                 ? { dialog: 'Send 120 EUR to the synthetic payee?' }
@@ -507,9 +681,12 @@ test(
             appSessions++;
             const session = await integrationFixture.provider.createSession(...args);
             session.upload = async (_action, file) => {
+              uploadAttempts++;
+              if (uploadFailure) throw uploadFailure;
               uploads.push(Buffer.from(file.bytes).toString());
               return { name: file.name, mimetype: file.mimeType, s3key: randomUUID() };
             };
+            if (unoffered) session.offers = async (action) => action !== unoffered;
             const search = session.search.bind(session);
             session.search = async (...input) =>
               toolSearch ? { tools: toolSearch, suggestions: [] } : search(...input);
@@ -589,11 +766,20 @@ test(
       origin: `http://localhost:${port}`,
       cookie: `${accessCookie(port)}=${await accessKey(dataRoot)}`,
     };
-    const request = (
+    let messagesAvailableAt = 0;
+    const request = async (
       method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
       path: string,
       payload?: Record<string, unknown>,
-    ) => application.app.inject({ method, url: path, headers, payload });
+    ) => {
+      const message = method === 'POST' && path === '/api/messages';
+      if (message && messagesAvailableAt > Date.now())
+        await delay(messagesAvailableAt - Date.now());
+      const response = await application.app.inject({ method, url: path, headers, payload });
+      if (message && Number(response.headers['x-ratelimit-remaining']) === 0)
+        messagesAvailableAt = Date.now() + Number(response.headers['x-ratelimit-reset']) * 1000;
+      return response;
+    };
     async function waitFor(id: string, status: string) {
       for (let attempt = 0; attempt < 300; attempt++) {
         const turn = (await pool.query('SELECT status,error FROM turns WHERE id=$1', [id])).rows[0];
@@ -824,6 +1010,56 @@ test(
       );
 
     try {
+      await t.test(
+        'Stop cancels schedule reviews before a confirmation or schedule is saved',
+        async () => {
+          for (const purpose of [undefined, 'confirmation_review']) {
+            let release!: () => void;
+            let entered!: (signal?: AbortSignal) => void;
+            const reviewing = new Promise<AbortSignal | undefined>(
+              (resolve) => (entered = resolve),
+            );
+            heldReview = {
+              purpose,
+              entered,
+              release: new Promise<void>((resolve) => (release = resolve)),
+            };
+            const text = `Create a synthetic stopped schedule ${randomUUID()}`;
+            const title = `Stopped review ${randomUUID()}`;
+            plans.set(text, {
+              action: 'schedule_create',
+              args: {
+                title,
+                prompt: 'Read the synthetic note.',
+                kind: 'once',
+                runAt: '2099-01-01T09:00:00Z',
+                timeZone: 'UTC',
+              },
+            });
+            try {
+              const response = await request('POST', '/api/messages', { text });
+              assert.equal(response.statusCode, 200, response.body);
+              const turnId = response.json().turnId as string;
+              const signal = await reviewing;
+              assert.equal((await request('POST', '/api/thread/stop')).statusCode, 200);
+              assert.ok(signal);
+              assert.equal(signal.aborted, true);
+              release();
+              await waitFor(turnId, 'cancelled');
+              assert.equal(
+                (await pool.query('SELECT 1 FROM schedules WHERE title=$1', [title])).rowCount,
+                0,
+              );
+              assert.deepEqual(await approvalsFor(turnId), []);
+            } finally {
+              heldReview = undefined;
+              plans.delete(text);
+              release();
+            }
+          }
+        },
+      );
+
       await t.test(
         'model settings use the trust check and save only the approved selection',
         async () => {
@@ -1183,6 +1419,30 @@ test(
       );
 
       await t.test(
+        'an action the connection service does not offer asks for no approval',
+        async () => {
+          const writes = integrationFixture.writes.length;
+          unoffered = 'GMAIL_SEND_MESSAGE';
+          const text = `Synthetic proposal ${randomUUID()}`;
+          plans.set(text, {
+            tool: 'apps',
+            action: 'GMAIL_SEND_MESSAGE',
+            args: { recipient_email: 'collector@example.test' },
+          });
+          const refused = (await submitUserMessage(text)).turnId;
+          await waitFor(refused, 'failed').finally(() => {
+            unoffered = undefined;
+          });
+          assert.match(
+            (await pool.query('SELECT error FROM turns WHERE id=$1', [refused])).rows[0].error,
+            /GMAIL_SEND_MESSAGE/,
+          );
+          assert.deepEqual(await approvalsFor(refused), []);
+          assert.equal(integrationFixture.writes.length, writes);
+        },
+      );
+
+      await t.test(
         'an approved action runs once, a failure returns to its task, and an unsaved access path is never asked about',
         async () => {
           const held = await propose(
@@ -1310,6 +1570,467 @@ test(
             assert.match(batchErrors.slice(errors).join('\n'), /click target is not identified/);
           } finally {
             browserControls = [{ role: 'button', name: 'Authorize payment' }];
+          }
+        },
+      );
+
+      await t.test(
+        'a task browser repeat needs a new approval before its second click',
+        async () => {
+          const title = `Synthetic bank task ${randomUUID()}`;
+          const ownerRequest = `Start a task to inspect the synthetic bank page ${title}.`;
+          const reply = `Click Authorize payment again for ${title}.`;
+          const question = `Should I click Authorize payment again for ${title}?`;
+          const click = { tool: 'browser', action: 'click', args: { selector: '@e7' } };
+          const clicks = () => browserActs.filter((act) => act.action === 'click').length;
+          const before = clicks();
+          try {
+            batches.set(ownerRequest, {
+              subagents: false,
+              sequential: true,
+              chatOnly: true,
+              calls: [
+                {
+                  tool: 'task',
+                  action: 'start',
+                  args: {
+                    title,
+                    message: 'I will inspect the synthetic bank page.',
+                    doneWhen: 'The synthetic page has been checked.',
+                    now: 'Checking the page',
+                  },
+                },
+              ],
+              taskCalls: [click],
+            });
+            await waitFor((await submitUserMessage(ownerRequest)).turnId, 'succeeded');
+            const task = (
+              await pool.query('SELECT id,turn_id FROM tasks WHERE owner_id=$1 AND title=$2', [
+                ownerId,
+                title,
+              ])
+            ).rows[0];
+            assert.ok(task);
+            await waitFor(task.turn_id, 'waiting');
+            const [first] = await approvalsFor(task.turn_id);
+            assert.equal(first.action, 'NOD_browser');
+            assert.equal(first.status, 'pending');
+            assert.equal(clicks(), before);
+            questionAfterConfirm = question;
+            const accepted = await request('POST', '/api/messages', {
+              text: 'Click Authorize payment',
+              replyToMessageId: first.confirmation_message_id,
+              approvalAnswer: { approvalId: first.id, approved: true },
+            });
+            assert.equal(accepted.statusCode, 200, accepted.body);
+            await waitFor(accepted.json().turnId, 'waiting');
+            assert.equal(clicks(), before + 1);
+            const savedFirst = (await approvalsFor(task.turn_id))[0];
+            assert.equal(savedFirst.status, 'completed');
+            const savedQuestion = (
+              await pool.query(
+                "SELECT id FROM messages WHERE turn_id=$1 AND role='assistant' AND text=$2",
+                [accepted.json().turnId, question],
+              )
+            ).rows[0];
+            assert.ok(savedQuestion);
+            asked.add(reply);
+            plans.set(reply, click);
+            repeatDecision = 'new';
+            const repeated = await request('POST', '/api/messages', {
+              text: reply,
+              replyToMessageId: savedQuestion.id,
+            });
+            assert.equal(repeated.statusCode, 200, repeated.body);
+            await waitFor(repeated.json().turnId, 'waiting|succeeded');
+            const repeatedTurn = (
+              await pool.query('SELECT session_id FROM turns WHERE id=$1', [repeated.json().turnId])
+            ).rows[0];
+            const taskSession = (
+              await pool.query('SELECT session_id FROM turns WHERE id=$1', [task.turn_id])
+            ).rows[0];
+            assert.equal(repeatedTurn.session_id, taskSession.session_id);
+            const [second] = await approvalsFor(repeated.json().turnId);
+            assert.ok(second, 'A repeated task browser action must save a new approval.');
+            assert.ok(
+              repeatChecks.some(
+                (input) => Object(input).reply === reply && Object(input).question === question,
+              ),
+            );
+            assert.equal(second.status, 'pending');
+            assert.equal(second.source_message_id, repeated.json().messageId);
+            assert.deepEqual(second.args, first.args);
+            assert.equal(clicks(), before + 1);
+            assert.deepEqual((await approvalsFor(task.turn_id))[0].result, savedFirst.result);
+            const confirmed = await request('POST', '/api/messages', {
+              text: 'Click Authorize payment',
+              replyToMessageId: second.confirmation_message_id,
+              approvalAnswer: { approvalId: second.id, approved: true },
+            });
+            assert.equal(confirmed.statusCode, 200, confirmed.body);
+            await waitFor(confirmed.json().turnId, 'succeeded');
+            assert.equal(clicks(), before + 2);
+            assert.equal((await approvalsFor(repeated.json().turnId))[0].status, 'completed');
+            assert.deepEqual((await approvalsFor(task.turn_id))[0].result, savedFirst.result);
+          } finally {
+            questionAfterConfirm = undefined;
+            repeatDecision = 'same';
+            batches.delete(ownerRequest);
+            plans.delete(reply);
+            asked.delete(reply);
+          }
+        },
+      );
+
+      await t.test('a legacy browser repeat checks its target before wording', async (t) => {
+        for (const [kind, command] of [
+          ['y coordinate', { y: 0.5 }],
+          [
+            'points',
+            {
+              points: [
+                { x: 0.5, y: 0.5 },
+                { x: 0.5, y: 0.5 },
+              ],
+            },
+          ],
+        ] as const)
+          await t.test(kind, async () => {
+            const question = `Should I repeat the synthetic ${kind} click?`;
+            const reply = `Repeat the synthetic ${kind} click ${randomUUID()}.`;
+            const clicks = () => browserActs.filter((act) => act.action === 'click').length;
+            const before = clicks();
+            try {
+              const initial = await propose('click', { selector: '@e7' }, 'browser');
+              const [first] = await approvalsFor(initial);
+              assert.equal(first.action, 'NOD_browser');
+              questionAfterConfirm = question;
+              const accepted = await request('POST', '/api/messages', {
+                text: 'Click Authorize payment',
+                replyToMessageId: first.confirmation_message_id,
+                approvalAnswer: { approvalId: first.id, approved: true },
+              });
+              assert.equal(accepted.statusCode, 200, accepted.body);
+              await waitFor(accepted.json().turnId, 'waiting');
+              const saved = (await approvalsFor(initial))[0];
+              assert.equal(saved.status, 'completed');
+              assert.equal(clicks(), before + 1);
+              const savedQuestion = (
+                await pool.query(
+                  "SELECT id FROM messages WHERE turn_id=$1 AND role='assistant' AND text=$2",
+                  [accepted.json().turnId, question],
+                )
+              ).rows[0];
+              assert.ok(savedQuestion);
+              browserControls = [
+                { role: 'RootWebArea', name: 'Synthetic bank' },
+                { role: 'button', name: 'Secondary control' },
+              ];
+              const legacy = {
+                ...first.args,
+                control: browserControls,
+                command: { action: 'click', ...command },
+              };
+              await pool.query('UPDATE approvals SET args=$2::jsonb WHERE id=$1', [
+                first.id,
+                legacy,
+              ]);
+              let wording = 0;
+              browserWording = (input) => {
+                wording++;
+                return input.purpose === 'confirmation_review'
+                  ? { valid: true }
+                  : syntheticConfirmation(input);
+              };
+              asked.add(reply);
+              plans.set(reply, { tool: 'browser', action: 'click', args: { ...command } });
+              repeatDecision = 'new';
+              const repeated = await request('POST', '/api/messages', {
+                text: reply,
+                replyToMessageId: savedQuestion.id,
+              });
+              assert.equal(repeated.statusCode, 200, repeated.body);
+              await waitFor(repeated.json().turnId, 'waiting|failed');
+              assert.deepEqual(repeatChecks.at(-1), {
+                action: 'NOD_browser',
+                args: legacy,
+                reply,
+                question,
+              });
+              const turn = (
+                await pool.query('SELECT status,error FROM turns WHERE id=$1', [
+                  repeated.json().turnId,
+                ])
+              ).rows[0];
+              assert.equal(turn.status, 'failed');
+              assert.match(turn.error, /click target is not identified/);
+              assert.deepEqual(await approvalsFor(repeated.json().turnId), []);
+              assert.equal(wording, 0);
+              assert.equal(clicks(), before + 1);
+              const retained = (await approvalsFor(initial))[0];
+              assert.equal(retained.status, 'completed');
+              assert.deepEqual(retained.args, legacy);
+              assert.deepEqual(retained.result, saved.result);
+            } finally {
+              browserControls = [{ role: 'button', name: 'Authorize payment' }];
+              browserWording = undefined;
+              questionAfterConfirm = undefined;
+              repeatDecision = 'same';
+              plans.delete(reply);
+              asked.delete(reply);
+            }
+          });
+      });
+
+      await t.test(
+        'a labeled click keeps its replay command out of wording and waits for approval',
+        async () => {
+          const before = browserActs.filter((act) => act.action === 'click').length;
+          const wording: Array<Record<string, any>> = [];
+          browserWording = (input) => {
+            wording.push(structuredClone(input));
+            if (input.purpose === 'confirmation_review')
+              return input.data.args.command
+                ? { valid: false, reason: 'The proposed operation contains a raw browser command.' }
+                : { valid: true };
+            return syntheticConfirmation(input);
+          };
+          try {
+            const held = await propose('click', { selector: '@e7' }, 'browser');
+            const [card] = await approvalsFor(held);
+            assert.ok(card);
+            assert.equal(card.status, 'pending');
+            assert.deepEqual(card.args.command, { action: 'click', selector: '@e7' });
+            assert.equal(browserActs.filter((act) => act.action === 'click').length, before);
+            assert.deepEqual(
+              wording.map((input) => input.purpose),
+              ['confirmation', 'confirmation_review'],
+            );
+            for (const input of wording) {
+              assert.equal(input.data.args.command, undefined);
+              assert.equal(input.data.args.step, 'click');
+              assert.deepEqual(input.data.args.control, [
+                { role: 'button', name: 'Authorize payment' },
+              ]);
+              assert.deepEqual(input.data.args.submits, {
+                method: 'POST',
+                to: 'https://bank.example.test/transfer/send',
+              });
+            }
+            const reviewed = (fallbackChecks as Array<Record<string, any>>).findLast(
+              (input) => input.action?.name === 'NOD_browser',
+            );
+            assert.deepEqual(reviewed?.action.arguments.command, {
+              action: 'click',
+              selector: '@e7',
+            });
+            const approved = await request('POST', '/api/messages', {
+              text: 'Yes',
+              replyToMessageId: card.confirmation_message_id,
+              clientMessageId: randomUUID(),
+            });
+            assert.equal(approved.statusCode, 200, approved.body);
+            await waitFor(approved.json().turnId, 'succeeded');
+            assert.equal(browserActs.filter((act) => act.action === 'click').length, before + 1);
+            assert.equal((await approvalsFor(held))[0].status, 'completed');
+          } finally {
+            browserWording = undefined;
+          }
+        },
+      );
+
+      await t.test(
+        'unidentified coordinate, selector and Enter steps return to inspection before approval',
+        async () => {
+          const seen: BrowserAction[] = [];
+          let page: BrowserPage = {
+            origin: 'https://review.example.test',
+            url: 'https://review.example.test/request',
+          };
+          calendarBrowser = {
+            currentPage: async () => page,
+            act: async (_id, step) => {
+              seen.push(step);
+              return {
+                text: `Result:\n${JSON.stringify('Submit the synthetic request for review.')}`,
+                url: page.url,
+              };
+            },
+          };
+          const controls = [{ role: 'RootWebArea', name: 'Synthetic review page' }];
+          const cases: Array<{
+            step: BrowserAction;
+            controls?: BrowserPage['controls'];
+            submits?: BrowserPage['submits'];
+          }> = [
+            {
+              step: { action: 'click', selector: '#blank-button' },
+              controls: [
+                { role: 'button', name: '' },
+                { role: 'form', name: 'Payment form' },
+              ],
+            },
+            {
+              step: { action: 'press', key: 'Enter' },
+              controls: [
+                { role: 'textbox', name: '' },
+                { role: 'region', name: 'Account settings' },
+              ],
+              submits: 'unknown',
+            },
+            {
+              step: { action: 'type', text: 'synthetic\n' },
+              controls: [
+                { role: 'textbox', name: ' ' },
+                { role: 'button', name: 'Submit request' },
+              ],
+            },
+            {
+              step: { action: 'click', x: 0.5, y: 0.5 },
+              controls: [
+                { role: 'generic', name: '' },
+                { role: 'region', name: 'Payment details' },
+              ],
+              submits: { method: 'POST', to: 'https://review.example.test/submit' },
+            },
+            {
+              step: {
+                action: 'click',
+                points: [
+                  { x: 0.5, y: 0.5 },
+                  { x: 0.5, y: 0.5 },
+                ],
+              },
+              controls,
+              submits: { method: 'POST', to: 'https://review.example.test/submit' },
+            },
+            {
+              step: { action: 'click', x: 0.5, y: 0.5 },
+              controls: [{ role: 'button', name: ' ' }],
+              submits: { method: 'POST', to: 'https://review.example.test/submit' },
+            },
+            {
+              step: { action: 'click', y: 0.5 },
+              controls,
+              submits: { method: 'POST', to: 'https://review.example.test/submit' },
+            },
+            { step: { action: 'click', selector: '@e7' }, controls },
+            {
+              step: { action: 'click', selector: '#unnamed' },
+              controls: [{ role: 'button', name: ' \t ' }],
+              submits: 'unknown',
+            },
+            { step: { action: 'press', key: 'Enter' }, controls },
+            { step: { action: 'press', key: 'Enter' }, submits: 'unknown' },
+            { step: { action: 'type', text: 'synthetic\n' }, controls, submits: 'unknown' },
+            {
+              step: { action: 'type', text: 'synthetic\r' },
+              controls: [{ role: 'textbox', name: ' ' }],
+            },
+            { step: { action: 'press', key: 'Shift+Enter' }, controls, submits: 'unknown' },
+            { step: { action: 'press', key: 'Control+Enter' }, controls },
+            { step: { action: 'press', key: 'NumpadEnter' }, controls },
+            { step: { action: 'press', key: 'Return' }, controls },
+            { step: { action: 'press', key: 'Enter+Shift' }, controls },
+            { step: { action: 'press', key: '\r' }, controls },
+            { step: { action: 'press', key: '\n' }, controls },
+          ];
+          try {
+            for (const entry of cases) {
+              page = {
+                origin: page.origin,
+                url: page.url,
+                controls: entry.controls,
+                submits: entry.submits,
+              };
+              const text = `Synthetic unidentified step ${randomUUID()}`;
+              const { action, ...args } = entry.step;
+              const errors = batchErrors.length;
+              const before = seen.length;
+              batches.set(text, { subagents: false, calls: [{ tool: 'browser', action, args }] });
+              const response = await request('POST', '/api/messages', { text });
+              assert.equal(response.statusCode, 200, response.body);
+              await waitFor(response.json().turnId, 'waiting|succeeded');
+              assert.deepEqual(await approvalsFor(response.json().turnId), []);
+              assert.equal(seen.length, before);
+              assert.match(batchErrors.slice(errors).join('\n'), /target is not identified/);
+              if (entry.step.action === 'type')
+                assert.match(batchErrors.slice(errors).join('\n'), /typed line break/);
+            }
+            for (const entry of [
+              {
+                step: { action: 'click', selector: '#named-custom' },
+                controls: [
+                  { role: 'generic', name: 'Submit custom request' },
+                  { role: 'region', name: 'Request details' },
+                ],
+              },
+              {
+                step: { action: 'click', x: 0.5, y: 0.5 },
+                controls: [{ role: 'button', name: 'Submit request' }],
+                submits: { method: 'POST', to: 'https://review.example.test/submit' },
+              },
+              {
+                step: { action: 'click', selector: '#submit' },
+                controls: [{ role: 'button', name: 'Submit request' }],
+                submits: 'unknown',
+              },
+              {
+                step: { action: 'click', selector: '#submit-form' },
+                controls,
+                submits: { method: 'POST', to: 'https://review.example.test/submit' },
+              },
+              {
+                step: { action: 'press', key: 'Enter' },
+                controls: [],
+                submits: { method: 'POST', to: 'https://review.example.test/submit' },
+              },
+              {
+                step: { action: 'type', text: 'synthetic\n' },
+                controls: [{ role: 'textbox', name: ' Request ' }],
+              },
+            ] satisfies typeof cases) {
+              page = {
+                origin: page.origin,
+                url: page.url,
+                controls: entry.controls,
+                submits: entry.submits,
+              };
+              const { action, ...args } = entry.step;
+              const before = seen.filter((step) => step.action !== 'evaluate').length;
+              const held = await propose(action, args, 'browser');
+              const [card] = await approvalsFor(held);
+              assert.equal(card.status, 'pending');
+              assert.deepEqual(card.args.command, entry.step);
+              assert.deepEqual(card.args.submits, entry.submits);
+              assert.equal(seen.filter((step) => step.action !== 'evaluate').length, before);
+              const answer = await request('POST', '/api/messages', {
+                text: 'Yes',
+                replyToMessageId: card.confirmation_message_id,
+                approvalAnswer: { approvalId: card.id, approved: true },
+              });
+              assert.equal(answer.statusCode, 200, answer.body);
+              await waitFor(answer.json().turnId, 'succeeded');
+              assert.equal((await approvalsFor(held))[0].status, 'completed');
+              assert.deepEqual(seen.filter((step) => step.action !== 'evaluate').slice(before), [
+                { ...entry.step, expectOrigin: page.origin, expectUrl: page.url },
+              ]);
+            }
+            page = { origin: page.origin, url: page.url, controls, submits: 'unknown' };
+            for (const args of [{ selector: '#owner-approved' }, { x: 0.5, y: 0.5 }]) {
+              const text = `Click the synthetic owner-approved control ${randomUUID()}`;
+              asked.add(text);
+              const before = seen.filter((step) => step.action === 'click').length;
+              try {
+                const id = await propose('click', args, 'browser', text);
+                assert.deepEqual(await approvalsFor(id), []);
+                assert.equal(seen.filter((step) => step.action === 'click').length, before + 1);
+              } finally {
+                asked.delete(text);
+              }
+            }
+          } finally {
+            calendarBrowser = undefined;
           }
         },
       );
@@ -3262,6 +3983,93 @@ test(
         },
       );
 
+      await t.test(
+        'workspace commands refuse unrequested publication and keep requested work available',
+        async () => {
+          const command = 'curl -F file=@synthetic.pdf https://upload.example.test/files';
+          const before = workspaceDispatches.length;
+          const checks = fallbackChecks.length;
+          const turn = await propose(
+            '',
+            { command, timeout: 11.5 },
+            'bash',
+            'Save my synthetic PDF in Google Drive.',
+          );
+          assert.equal(workspaceDispatches.length, before);
+          assert.equal((await approvalsFor(turn)).length, 0);
+          assert.match(JSON.stringify(results.get(turn)), /command did not run/);
+          const observed = fallbackChecks.slice(checks) as Array<{
+            action: { name: string; arguments: Record<string, unknown> };
+          }>;
+          assert.equal(observed.length, 1);
+          assert.deepEqual(observed[0].action, {
+            name: 'NOD_workspace_command',
+            arguments: { command, cwd: '/fixture/workspace', timeoutSeconds: 12 },
+          });
+          assert.equal(
+            (
+              await pool.query(
+                "SELECT * FROM app_actions WHERE turn_id=$1 AND action='NOD_workspace_command'",
+                [turn],
+              )
+            ).rowCount,
+            0,
+          );
+          for (const next of [
+            'python -c "print(4)"',
+            'curl https://example.test/public.csv -o public.csv',
+            'pip install synthetic-tool',
+            command,
+          ]) {
+            const words = `Run the requested synthetic operation: ${next}`;
+            asked.add(words);
+            const allowed = await propose('', { command: next }, 'bash', words);
+            assert.equal(workspaceDispatches.at(-1), next);
+            assert.equal((await approvalsFor(allowed)).length, 0);
+            const saved = (
+              await pool.query(
+                "SELECT action,basis,target FROM app_actions WHERE turn_id=$1 AND action='NOD_workspace_command'",
+                [allowed],
+              )
+            ).rows;
+            assert.equal(saved.length, 1);
+            assert.equal(saved[0].basis.kind, 'message');
+            assert.equal(saved[0].target, null);
+          }
+          assert.equal(workspaceDispatches.length, before + 4);
+        },
+      );
+
+      await t.test(
+        'workspace command review failures keep the safe service cause and never dispatch',
+        async () => {
+          const secret = 'synthetic-model-key';
+          const before = workspaceDispatches.length;
+          workspaceReview = async () => {
+            throw Object.assign(new Error(`Synthetic review unavailable token=${secret}`), {
+              statusCode: 503,
+            });
+          };
+          try {
+            const turn = await propose(
+              '',
+              { command: 'python opaque-script.py' },
+              'bash',
+              'Review the synthetic document.',
+            );
+            const result = JSON.stringify(results.get(turn));
+            assert.match(result, /command did not run.*Trust check failed/);
+            assert.match(result, /HTTP 503/);
+            assert.match(result, /Synthetic review unavailable/);
+            assert.equal(result.includes(secret), false);
+            assert.equal(workspaceDispatches.length, before);
+            assert.equal((await approvalsFor(turn)).length, 0);
+          } finally {
+            workspaceReview = undefined;
+          }
+        },
+      );
+
       await t.test('tool discovery runs without waiting for the checker', async () => {
         const turn = await propose('SEARCH_TOOLS', { query: 'gmail email' }, 'apps');
         const result = results.get(turn);
@@ -3604,6 +4412,81 @@ test(
         },
       );
       await t.test(
+        'a failed approved attachment upload keeps its safe reason on the original card',
+        async (t) => {
+          t.after(() => {
+            uploadFailure = undefined;
+            workspaceFiles.delete('failed-report.pdf');
+          });
+          const sends = () =>
+            integrationFixture.writes.filter((write) => write.action === 'GMAIL_SEND_EMAIL').length;
+          const beforeSends = sends();
+          const beforeAttempts = uploadAttempts;
+          const beforeUploads = uploads.length;
+          workspaceFiles.set('failed-report.pdf', Buffer.from('%PDF-1.7 synthetic failed report'));
+          const held = await propose(
+            'GMAIL_SEND_EMAIL',
+            {
+              recipient_email: 'collector@example.test',
+              subject: 'Synthetic failed report',
+              body: 'Synthetic attachment.',
+              attachment: { workspaceFile: 'failed-report.pdf', mimeType: 'application/pdf' },
+            },
+            'apps',
+          );
+          const [card] = await approvalsFor(held);
+          assert.equal(card.status, 'pending');
+          assert.equal(uploadAttempts, beforeAttempts);
+          uploadFailure = new Error(
+            'The attachment upload failed (HTTP 503): synthetic provider unavailable; api_key=PRIVATE_UPLOAD_CANARY',
+          );
+          const clicked = {
+            text: 'Send',
+            replyToMessageId: card.confirmation_message_id,
+            clientMessageId: randomUUID(),
+            approvalAnswer: { approvalId: card.id, approved: true },
+          };
+          const approved = await request('POST', '/api/messages', clicked);
+          assert.equal(approved.statusCode, 200, approved.body);
+          await waitFor(approved.json().turnId, 'succeeded');
+          const saved = (await approvalsFor(held))[0];
+          assert.equal(saved.status, 'expired');
+          assert.equal(uploadAttempts, beforeAttempts + 1);
+          assert.equal(uploads.length, beforeUploads);
+          assert.equal(sends(), beforeSends);
+          for (let read = 0; read < 2; read++) {
+            const response = await request(
+              'GET',
+              '/api/messages/around/' + card.confirmation_message_id,
+            );
+            assert.equal(response.statusCode, 200, response.body);
+            const message = response
+              .json()
+              .find((item: { id: string }) => item.id === card.confirmation_message_id);
+            assert.equal(message.approval.id, card.id);
+            assert.equal(message.approval.state, 'expired');
+            assert.match(message.approval.failure ?? '', /HTTP 503/);
+            assert.match(message.approval.failure, /synthetic provider unavailable/);
+            assert.equal(saved.result.error, message.approval.failure);
+            assert.doesNotMatch(JSON.stringify({ saved, message }), /PRIVATE_UPLOAD_CANARY/);
+            for (const Component of [ApprovalCard, ApprovalChoiceCard]) {
+              const html = renderToStaticMarkup(
+                createElement(Component, {
+                  approval: message.approval,
+                  children: 'Synthetic attachment approval',
+                }),
+              );
+              assert.match(html, /Not run/);
+              assert.match(html, /HTTP 503/);
+              assert.doesNotMatch(html, /PRIVATE_UPLOAD_CANARY/);
+            }
+          }
+          assert.equal(uploadAttempts, beforeAttempts + 1);
+          assert.equal(sends(), beforeSends);
+        },
+      );
+
+      await t.test(
         'sign-in method selection needs exact-origin consent before binding controls',
         async () => {
           const input = {
@@ -3660,6 +4543,930 @@ test(
           }
         },
       );
+      await t.test(
+        'HTTP confirmations describe the exact request and bind it to the selected account',
+        async () => {
+          const { createAppGrantVault } = await import('../src/server/vault-app-grants.ts');
+          const calls: Array<{ method: string; url: string; body: string }> = [];
+          const server = createServer(async (incoming, outgoing) => {
+            const chunks: Buffer[] = [];
+            for await (const chunk of incoming) chunks.push(Buffer.from(chunk));
+            assert.equal(incoming.headers.authorization, 'Bearer synthetic-http-context-token');
+            calls.push({
+              method: incoming.method!,
+              url: incoming.url!,
+              body: Buffer.concat(chunks).toString(),
+            });
+            outgoing.setHeader('content-type', 'application/json');
+            outgoing.end(JSON.stringify({ value: 'Synthetic signals' }));
+          });
+          await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+          const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+          const connectionId = randomUUID();
+          const pathId = randomUUID();
+          const paths = [
+            { id: pathId, kind: 'http', endpoint: `${origin}/v2`, auth: 'bearer', local: true },
+          ];
+          const route = '/signals?label=Caf%C3%A9&route=one%2Ftwo';
+          const url = `${origin}/v2${route}`;
+          const wording: Array<Record<string, any>> = [];
+          let expected: Record<string, unknown>;
+          let duringWording: (() => Promise<void>) | undefined;
+          try {
+            await pool.query(
+              'INSERT INTO discovered_connections(id,owner_id,service,name,account_name,paths) VALUES($1,$2,$3,$4,$5,$6)',
+              [
+                connectionId,
+                ownerId,
+                'http-context-fixture',
+                'Synthetic HTTP API',
+                'Synthetic account',
+                JSON.stringify(paths),
+              ],
+            );
+            const grants = await createAppGrantVault(pool, {
+              ownerId,
+              keyStore: {
+                id: 'fixture',
+                configured: true,
+                getKey: async () => Buffer.alloc(32, 7),
+              },
+            });
+            await grants.put(connectionId, 'synthetic-http-context-token');
+            confirmationModel = async (input) => {
+              const current = input as Record<string, any>;
+              wording.push(structuredClone(current));
+              if (duringWording) {
+                const change = duringWording;
+                duringWording = undefined;
+                await change();
+              }
+              if (current.purpose === 'confirmation_review')
+                return current.data.action === 'HTTP request'
+                  ? { valid: true }
+                  : {
+                      valid: false,
+                      reason: 'The proposed operation is a raw connected HTTP wrapper.',
+                    };
+              return {
+                text: `Can I make the ${expected.method} request to ${url}?`,
+                action: 'Make request',
+              };
+            };
+            for (const method of ['GET', 'POST'] as const) {
+              const body = { label: 'Synthetic record', count: 2 };
+              expected = { method, url, ...(method === 'POST' ? { body } : {}) };
+              const args = {
+                connectionId,
+                pathId,
+                method,
+                path: route,
+                body: method === 'GET' ? { ignored: 'synthetic-ignored-body' } : body,
+              };
+              const before = calls.length;
+              wording.length = 0;
+              const held = await propose('CONNECTED_HTTP', args, 'apps');
+              const [card] = await approvalsFor(held);
+              assert.equal(card.status, 'pending');
+              assert.deepEqual(card.args, args);
+              assert.equal(typeof card.details.verifiedBinding, 'string');
+              assert.equal(calls.length, before);
+              assert.deepEqual(
+                wording.map((input) => input.purpose),
+                ['confirmation', 'confirmation_review'],
+              );
+              for (const input of wording) {
+                assert.equal(input.data.action, 'HTTP request');
+                assert.deepEqual(input.data.args, expected);
+                assert.doesNotMatch(
+                  JSON.stringify(input),
+                  /synthetic-http-context-token|verifiedBinding|connectionId|pathId|synthetic-ignored-body/,
+                );
+              }
+              const question = await confirmationFor(card);
+              assert.ok(question.includes(method));
+              assert.ok(question.includes('/v2/signals'));
+              assert.ok(question.includes(String((server.address() as { port: number }).port)));
+              const response = await request('POST', '/api/messages', {
+                text: 'Yes',
+                replyToMessageId: card.confirmation_message_id,
+                approvalAnswer: { approvalId: card.id, approved: true },
+              });
+              assert.equal(response.statusCode, 200, response.body);
+              await waitFor(response.json().turnId, 'succeeded');
+              assert.equal((await approvalsFor(held))[0].status, 'completed');
+              const saved = await request(
+                'GET',
+                `/api/messages/around/${card.confirmation_message_id}`,
+              );
+              assert.equal(saved.statusCode, 200, saved.body);
+              const message = saved
+                .json()
+                .find((item: { id: string }) => item.id === card.confirmation_message_id);
+              assert.equal(message.approval.state, 'done');
+              assert.equal(message.text, question);
+              const html = renderToStaticMarkup(
+                createElement(ApprovalCard, {
+                  approval: message.approval,
+                  children: message.text,
+                }),
+              );
+              assert.ok(html.includes('/v2/signals'));
+              assert.ok(html.includes(method));
+              assert.doesNotMatch(html, /CONNECTED_HTTP|synthetic-http-context-token/);
+              assert.deepEqual(
+                calls.slice(before).map((call) => ({
+                  ...call,
+                  body: call.body ? JSON.parse(call.body) : undefined,
+                })),
+                [{ method, url: `/v2${route}`, body: method === 'GET' ? undefined : body }],
+              );
+              const repeated = await request('POST', '/api/messages', {
+                text: 'Yes',
+                replyToMessageId: card.confirmation_message_id,
+                approvalAnswer: { approvalId: card.id, approved: true },
+              });
+              assert.equal(repeated.statusCode, 409, repeated.body);
+              assert.equal(calls.length, before + 1);
+            }
+            expected = { method: 'GET', url };
+            const nextArgs = () => ({ connectionId, pathId, method: 'GET', path: route });
+            for (const changed of [false, true]) {
+              httpReview = async () => {
+                if (changed)
+                  await pool.query('UPDATE discovered_connections SET paths=$2 WHERE id=$1', [
+                    connectionId,
+                    JSON.stringify([{ ...paths[0], endpoint: `${origin}/replacement` }]),
+                  ]);
+                return { run: true, because: 'read' };
+              };
+              const prompt = `Synthetic HTTP direct request ${randomUUID()}`;
+              plans.set(prompt, {
+                tool: 'apps',
+                action: 'CONNECTED_HTTP',
+                args: {
+                  ...nextArgs(),
+                  path: `/auto-allowed?case=${changed ? 'changed' : 'unchanged'}`,
+                },
+              });
+              const response = await request('POST', '/api/messages', { text: prompt });
+              assert.equal(response.statusCode, 200, response.body);
+              const immediate = response.json().turnId;
+              await waitFor(immediate, 'succeeded|failed');
+              assert.deepEqual(await approvalsFor(immediate), []);
+              assert.equal(calls.length, 3);
+              if (changed) {
+                const turn = (await pool.query('SELECT error FROM turns WHERE id=$1', [immediate]))
+                  .rows[0];
+                assert.match(
+                  JSON.stringify(results.get(immediate)) ?? turn.error,
+                  /connected account changed/,
+                );
+              } else
+                assert.deepEqual(calls.at(-1), {
+                  method: 'GET',
+                  url: '/v2/auto-allowed?case=unchanged',
+                  body: '',
+                });
+              httpReview = undefined;
+              await pool.query('UPDATE discovered_connections SET paths=$2 WHERE id=$1', [
+                connectionId,
+                JSON.stringify(paths),
+              ]);
+            }
+            for (const reason of ['rebind', 'legacy', 'stop']) {
+              const held = await propose('CONNECTED_HTTP', nextArgs(), 'apps');
+              const [card] = await approvalsFor(held);
+              if (reason === 'rebind')
+                await pool.query('UPDATE discovered_connections SET paths=$2 WHERE id=$1', [
+                  connectionId,
+                  JSON.stringify([{ ...paths[0], endpoint: `${origin}/replacement` }]),
+                ]);
+              else if (reason === 'legacy')
+                await pool.query(
+                  "UPDATE approvals SET details=details-'verifiedBinding' WHERE id=$1",
+                  [card.id],
+                );
+              else assert.equal((await request('POST', '/api/thread/stop')).statusCode, 200);
+              const response = await request('POST', '/api/messages', {
+                text: 'Yes',
+                replyToMessageId: card.confirmation_message_id,
+                approvalAnswer: { approvalId: card.id, approved: true },
+              });
+              if (reason === 'stop') assert.equal(response.statusCode, 409, response.body);
+              else {
+                assert.equal(response.statusCode, 200, response.body);
+                await waitFor(response.json().turnId, 'succeeded|failed');
+                const [expired] = await approvalsFor(held);
+                assert.equal(expired.status, 'expired');
+                assert.match(
+                  JSON.stringify(expired.result),
+                  reason === 'rebind' ? /connected account changed/ : /no saved account binding/,
+                );
+              }
+              assert.equal(calls.length, 3);
+              await pool.query('UPDATE discovered_connections SET paths=$2 WHERE id=$1', [
+                connectionId,
+                JSON.stringify(paths),
+              ]);
+            }
+            duringWording = async () => {
+              await pool.query(
+                'UPDATE discovered_connections SET account_id=gen_random_uuid() WHERE id=$1',
+                [connectionId],
+              );
+            };
+            const prompt = `Synthetic HTTP account change ${randomUUID()}`;
+            plans.set(prompt, { tool: 'apps', action: 'CONNECTED_HTTP', args: nextArgs() });
+            const changed = await request('POST', '/api/messages', { text: prompt });
+            assert.equal(changed.statusCode, 200, changed.body);
+            await waitFor(changed.json().turnId, 'succeeded|failed');
+            assert.equal(duringWording, undefined);
+            assert.deepEqual(await approvalsFor(changed.json().turnId), []);
+            const changedTurn = (
+              await pool.query('SELECT error FROM turns WHERE id=$1', [changed.json().turnId])
+            ).rows[0];
+            assert.match(
+              JSON.stringify(results.get(changed.json().turnId)) ?? changedTurn.error,
+              /connected account changed before confirmation/,
+            );
+            assert.equal(calls.length, 3);
+
+            const body = { label: 'Synthetic repeated record', count: 4 };
+            const args = { ...nextArgs(), method: 'POST', body };
+            expected = { method: 'POST', url, body };
+            const initial = await propose('CONNECTED_HTTP', args, 'apps');
+            const [first] = await approvalsFor(initial);
+            const question = 'Should I send the same synthetic request again?';
+            questionAfterConfirm = question;
+            const accepted = await request('POST', '/api/messages', {
+              text: 'Make request',
+              replyToMessageId: first.confirmation_message_id,
+              approvalAnswer: { approvalId: first.id, approved: true },
+            });
+            assert.equal(accepted.statusCode, 200, accepted.body);
+            await waitFor(accepted.json().turnId, 'waiting');
+            assert.equal(calls.length, 4);
+            const savedQuestion = (
+              await pool.query(
+                "SELECT id FROM messages WHERE turn_id=$1 AND role='assistant' AND text=$2",
+                [accepted.json().turnId, question],
+              )
+            ).rows[0];
+            assert.ok(savedQuestion);
+            const reply = 'Send the same synthetic request again.';
+            plans.set(reply, { tool: 'apps', action: 'CONNECTED_HTTP', args });
+            repeatDecision = 'new';
+            httpReview = async () => ({ run: true, because: 'read' });
+            wording.length = 0;
+            const repeated = await request('POST', '/api/messages', {
+              text: reply,
+              replyToMessageId: savedQuestion.id,
+            });
+            assert.equal(repeated.statusCode, 200, repeated.body);
+            await waitFor(repeated.json().turnId, 'waiting');
+            const [second] = await approvalsFor(repeated.json().turnId);
+            assert.equal(second.status, 'pending');
+            assert.equal(second.source_message_id, repeated.json().messageId);
+            assert.deepEqual(second.details.request, expected);
+            assert.equal(second.details.verifiedBinding, first.details.verifiedBinding);
+            assert.equal(calls.length, 4);
+            assert.deepEqual(
+              wording.map((input) => input.purpose),
+              ['confirmation', 'confirmation_review'],
+            );
+            for (const input of wording) {
+              assert.equal(input.data.action, 'HTTP request');
+              assert.deepEqual(input.data.args, expected);
+            }
+            const confirmed = await request('POST', '/api/messages', {
+              text: 'Make request',
+              replyToMessageId: second.confirmation_message_id,
+              approvalAnswer: { approvalId: second.id, approved: true },
+            });
+            assert.equal(confirmed.statusCode, 200, confirmed.body);
+            await waitFor(confirmed.json().turnId, 'succeeded');
+            assert.equal(calls.length, 5);
+            assert.deepEqual(
+              { ...calls.at(-1), body: JSON.parse(calls.at(-1)!.body) },
+              {
+                method: 'POST',
+                url: `/v2${route}`,
+                body,
+              },
+            );
+          } finally {
+            questionAfterConfirm = undefined;
+            repeatDecision = 'same';
+            httpReview = undefined;
+            confirmationModel = undefined;
+            await pool.query('DELETE FROM vault_app_grants WHERE owner_id=$1 AND id=$2', [
+              ownerId,
+              connectionId,
+            ]);
+            await pool.query('DELETE FROM discovered_connections WHERE owner_id=$1 AND id=$2', [
+              ownerId,
+              connectionId,
+            ]);
+            server.closeAllConnections();
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+          }
+        },
+      );
+
+      await t.test(
+        'MCP confirmations use the selected tool definition and exact input',
+        async () => {
+          const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+          const { StreamableHTTPServerTransport } =
+            await import('@modelcontextprotocol/sdk/server/streamableHttp.js');
+          const rowsDescription = 'Read the current rows from the selected table.';
+          const executionDescription =
+            'Read an execution. includeData true returns node inputs and outputs; false returns status only.';
+          const calls: Array<{ tool: string; input: Record<string, unknown> }> = [];
+          const server = createServer(async (incoming, outgoing) => {
+            const mcp = new McpServer({ name: 'synthetic-review-context', version: '1' });
+            mcp.registerTool(
+              'data_table_rows',
+              {
+                description: rowsDescription,
+                inputSchema: { tableId: z.string().describe('The exact table ID.') },
+              },
+              async (input) => {
+                calls.push({ tool: 'data_table_rows', input });
+                return { content: [{ type: 'text', text: 'Synthetic rows: 3.' }] };
+              },
+            );
+            mcp.registerTool(
+              'get_workflow_execution',
+              {
+                description: executionDescription,
+                inputSchema: {
+                  executionId: z.string(),
+                  includeData: z
+                    .boolean()
+                    .default(false)
+                    .describe('Include node inputs and outputs when true.'),
+                },
+              },
+              async (input) => {
+                calls.push({ tool: 'get_workflow_execution', input });
+                return {
+                  content: [
+                    {
+                      type: 'text',
+                      text: input.includeData
+                        ? 'Synthetic node inputs and outputs.'
+                        : 'Synthetic execution status.',
+                    },
+                  ],
+                };
+              },
+            );
+            const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+            outgoing.on('close', () => void transport.close());
+            await mcp.connect(transport);
+            await transport.handleRequest(incoming, outgoing);
+          });
+          await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+          const endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}/mcp`;
+          let connection: { id: string; service: string; paths: Array<{ id: string }> } | undefined;
+          let statusOnly = false;
+          let executionId = 'synthetic-execution';
+          let duringWording: (() => Promise<void>) | undefined;
+          let wordingCalls = 0;
+          try {
+            const started = await request('POST', '/api/apps/mcp', {
+              name: 'Synthetic review context',
+              endpoint,
+              auth: 'bearer',
+            });
+            assert.equal(started.statusCode, 200, started.body);
+            const completed = await request(
+              'POST',
+              `/api/apps/discovery/${started.json().id}/complete`,
+              { token: 'synthetic-review-context-token', accountName: 'Synthetic review account' },
+            );
+            assert.equal(completed.statusCode, 200, completed.body);
+            connection = (
+              await pool.query(
+                'SELECT id,service,paths FROM discovered_connections WHERE owner_id=$1 AND name=$2',
+                [ownerId, 'Synthetic review context'],
+              )
+            ).rows[0];
+            assert.ok(connection);
+            confirmationModel = async (input) => {
+              const data = input.data as {
+                action: string;
+                args: { tool: string; input: Record<string, unknown> };
+                details: {
+                  account: { endpoint: string };
+                  tool?: {
+                    name: string;
+                    description: string;
+                    inputSchema: {
+                      properties: Record<string, { type: string; default?: unknown }>;
+                    };
+                  };
+                };
+              };
+              assert.equal(data.action, 'CONNECTED_MCP_CALL');
+              assert.equal('connectionId' in data.args, false);
+              assert.equal('pathId' in data.args, false);
+              assert.equal('verifiedBinding' in data.details, false);
+              assert.equal(JSON.stringify(input).includes('synthetic-review-context-token'), false);
+              assert.equal(data.details.account.endpoint, endpoint);
+              const definition = data.details.tool;
+              assert.ok(definition, 'The selected MCP tool definition is missing.');
+              assert.equal(definition.name, data.args.tool);
+              wordingCalls++;
+              let text: string;
+              if (definition.name === 'data_table_rows') {
+                assert.equal(definition.description, rowsDescription);
+                assert.equal(definition.inputSchema.properties.tableId!.type, 'string');
+                assert.deepEqual(data.args.input, { tableId: 'synthetic-table' });
+                text = 'Can I read the current rows from the synthetic table?';
+              } else {
+                assert.equal(definition.description, executionDescription);
+                assert.equal(definition.inputSchema.properties.includeData!.type, 'boolean');
+                assert.equal(definition.inputSchema.properties.includeData!.default, false);
+                assert.deepEqual(data.args.input, {
+                  executionId,
+                  includeData: true,
+                });
+                text = 'Can I read the node inputs and outputs for the synthetic execution?';
+              }
+              if (input.purpose === 'confirmation_review')
+                return input.text === text
+                  ? { valid: true }
+                  : {
+                      valid: false,
+                      reason: 'The question omits the requested node inputs and outputs.',
+                    };
+              if (duringWording) {
+                const change = duringWording;
+                duringWording = undefined;
+                await change();
+              }
+              return {
+                text: statusOnly ? 'Can I read only the synthetic execution status?' : text,
+                action: 'Read data',
+              };
+            };
+            for (const [tool, input, result] of [
+              ['data_table_rows', { tableId: 'synthetic-table' }, /Synthetic rows: 3/],
+              [
+                'get_workflow_execution',
+                { executionId, includeData: true },
+                /Synthetic node inputs and outputs/,
+              ],
+            ] as const) {
+              const before = calls.length;
+              const args: Record<string, unknown> = {
+                connectionId: connection.id,
+                pathId: connection.paths[0]!.id,
+                tool,
+                input,
+              };
+              const native =
+                tool === 'get_workflow_execution'
+                  ? [...advertisedMcp].find(([, description]) =>
+                      description.includes(executionDescription),
+                    )?.[0]
+                  : undefined;
+              if (tool === 'get_workflow_execution')
+                assert.ok(native, 'The native MCP tool must be offered.');
+              const held = await propose('CONNECTED_MCP_CALL', args, native ?? 'apps');
+              const [card] = await approvalsFor(held);
+              assert.equal(card.status, 'pending');
+              assert.deepEqual(card.args, args);
+              assert.equal(calls.length, before);
+              const response = await request('POST', '/api/messages', {
+                text: 'Yes',
+                replyToMessageId: card.confirmation_message_id,
+                approvalAnswer: { approvalId: card.id, approved: true },
+              });
+              assert.equal(response.statusCode, 200, response.body);
+              await waitFor(response.json().turnId, 'succeeded');
+              const saved = (await approvalsFor(held))[0];
+              assert.equal(saved.status, 'completed');
+              assert.match(JSON.stringify(saved.result), result);
+              assert.deepEqual(calls.slice(before), [{ tool, input }]);
+            }
+            statusOnly = true;
+            const prompt = `Synthetic full execution review ${randomUUID()}`;
+            plans.set(prompt, {
+              tool: 'apps',
+              action: 'CONNECTED_MCP_CALL',
+              args: {
+                connectionId: connection.id,
+                pathId: connection.paths[0]!.id,
+                tool: 'get_workflow_execution',
+                input: { executionId, includeData: true },
+              },
+            });
+            const rejected = await request('POST', '/api/messages', { text: prompt });
+            assert.equal(rejected.statusCode, 200, rejected.body);
+            await waitFor(rejected.json().turnId, 'succeeded|failed');
+            assert.deepEqual(await approvalsFor(rejected.json().turnId), []);
+            const failed = (
+              await pool.query('SELECT error FROM turns WHERE id=$1', [rejected.json().turnId])
+            ).rows[0];
+            assert.match(
+              JSON.stringify(results.get(rejected.json().turnId)) ?? failed.error,
+              /omits the requested node inputs and outputs/,
+            );
+            assert.equal(calls.length, 2);
+            assert.equal(wordingCalls, 8);
+            statusOnly = false;
+            const nextArgs = () => ({
+              connectionId: connection!.id,
+              pathId: connection!.paths[0]!.id,
+              tool: 'get_workflow_execution',
+              input: { executionId, includeData: true },
+            });
+            for (const reason of ['rebind', 'legacy']) {
+              executionId = `synthetic-pending-${reason}`;
+              const pending = await propose('CONNECTED_MCP_CALL', nextArgs(), 'apps');
+              const [pendingCard] = await approvalsFor(pending);
+              assert.equal(typeof pendingCard.details.verifiedBinding, 'string');
+              if (reason === 'rebind')
+                await pool.query(
+                  'UPDATE discovered_connections SET account_id=gen_random_uuid() WHERE id=$1',
+                  [connection.id],
+                );
+              else
+                await pool.query(
+                  "UPDATE approvals SET details=details-'verifiedBinding' WHERE id=$1",
+                  [pendingCard.id],
+                );
+              const answer = await request('POST', '/api/messages', {
+                text: 'Yes',
+                replyToMessageId: pendingCard.confirmation_message_id,
+                approvalAnswer: { approvalId: pendingCard.id, approved: true },
+              });
+              assert.equal(answer.statusCode, 200, answer.body);
+              await waitFor(answer.json().turnId, 'succeeded|failed');
+              const [expired] = await approvalsFor(pending);
+              assert.equal(expired.status, 'expired');
+              assert.match(
+                JSON.stringify(expired.result),
+                reason === 'rebind' ? /connected account changed/ : /no saved account binding/,
+              );
+              assert.equal(calls.length, 2);
+            }
+
+            executionId = 'synthetic-wording-rebind';
+            duringWording = async () => {
+              await pool.query(
+                'UPDATE discovered_connections SET account_id=gen_random_uuid() WHERE id=$1',
+                [connection!.id],
+              );
+            };
+            const changedPrompt = `Synthetic wording change ${randomUUID()}`;
+            plans.set(changedPrompt, {
+              tool: 'apps',
+              action: 'CONNECTED_MCP_CALL',
+              args: nextArgs(),
+            });
+            const changed = await request('POST', '/api/messages', { text: changedPrompt });
+            assert.equal(changed.statusCode, 200, changed.body);
+            await waitFor(changed.json().turnId, 'succeeded|failed');
+            assert.deepEqual(await approvalsFor(changed.json().turnId), []);
+            assert.equal(duringWording, undefined);
+            const changedTurn = (
+              await pool.query('SELECT error FROM turns WHERE id=$1', [changed.json().turnId])
+            ).rows[0];
+            assert.match(
+              JSON.stringify(results.get(changed.json().turnId)) ?? changedTurn.error,
+              /connected account changed before confirmation/,
+            );
+            assert.equal(calls.length, 2);
+            assert.equal(
+              decisionInputs.some((entry) => JSON.stringify(entry).includes(executionDescription)),
+              false,
+            );
+          } finally {
+            confirmationModel = undefined;
+            if (connection)
+              await request(
+                'POST',
+                `/api/apps/${connection.service}/accounts/${connection.id}/disconnect`,
+              );
+            server.closeAllConnections();
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+          }
+        },
+      );
+      await t.test('sign-in approval preserves its exact displayed origin', async () => {
+        const origin = 'https://bank.example.test';
+        const input = {
+          origin,
+          label: 'Synthetic bank',
+          kind: 'method',
+          methods: [{ label: 'Continue with Identity', selector: '@identity' }],
+          message: 'Choose a sign-in method.',
+        };
+        const before = methodBindings;
+        allowMethodBrowser = true;
+        confirmationModel = (request) => {
+          const data = request.data as { action: string; args: { origin: string } };
+          assert.equal(data.action, 'NOD_vault_allow');
+          assert.equal(data.args.origin, origin);
+          return request.purpose === 'confirmation_review'
+            ? {
+                valid:
+                  request.text === `Can I use ${origin}?` &&
+                  JSON.stringify(request.literalValues) === JSON.stringify([origin]),
+              }
+            : { text: `Can I use ${origin}?`, action: 'Use saved sign-in' };
+        };
+        try {
+          const held = await propose('Choose sign-in', input, 'sign_in');
+          const [card] = await approvalsFor(held);
+          assert.equal(card.action, 'NOD_vault_allow');
+          assert.deepEqual(card.args, { origin, kind: 'sign_in' });
+          assert.equal(methodBindings, before);
+          repeatAfterConfirm = { tool: 'sign_in', action: 'Choose sign-in', args: input };
+          const response = await request('POST', '/api/messages', {
+            text: 'Yes',
+            replyToMessageId: card.confirmation_message_id,
+            approvalAnswer: { approvalId: card.id, approved: true },
+          });
+          assert.equal(response.statusCode, 200, response.body);
+          await waitFor(response.json().turnId, 'waiting|succeeded');
+          assert.equal((await approvalsFor(held))[0].status, 'completed');
+          assert.equal(methodBindings, before + 1);
+          const form = (
+            await pool.query(
+              'SELECT origin,kind,status FROM credential_requests WHERE turn_id=$1',
+              [response.json().turnId],
+            )
+          ).rows[0];
+          assert.deepEqual(form, { origin, kind: 'method', status: 'pending' });
+        } finally {
+          confirmationModel = undefined;
+          allowMethodBrowser = false;
+          repeatAfterConfirm = undefined;
+        }
+      });
+      await t.test('MCP approval preserves the saved endpoint and dispatches once', async () => {
+        const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+        const { StreamableHTTPServerTransport } =
+          await import('@modelcontextprotocol/sdk/server/streamableHttp.js');
+        let calls = 0;
+        const requestPaths = new Set<string>();
+        const server = createServer(async (incoming, outgoing) => {
+          const path = new URL(incoming.url ?? '/', 'http://localhost').pathname;
+          requestPaths.add(path);
+          if (path !== '/tools(v2)') {
+            outgoing.writeHead(404);
+            outgoing.end('Synthetic MCP endpoint not found.');
+            return;
+          }
+          const mcp = new McpServer({ name: 'synthetic-readiness', version: '1' });
+          mcp.registerTool(
+            'readiness_check',
+            { description: 'Check the synthetic service.' },
+            async () => {
+              calls++;
+              return { content: [{ type: 'text', text: 'Synthetic service is ready.' }] };
+            },
+          );
+          const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+          outgoing.on('close', () => void transport.close());
+          await mcp.connect(transport);
+          await transport.handleRequest(incoming, outgoing);
+        });
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+        const endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}/tools(v2)`;
+        let connection:
+          | { id: string; service: string; paths: Array<{ id: string; endpoint: string }> }
+          | undefined;
+        try {
+          const started = await request('POST', '/api/apps/mcp', {
+            name: 'Synthetic readiness',
+            endpoint,
+            auth: 'bearer',
+          });
+          assert.equal(started.statusCode, 200, started.body);
+          const completed = await request(
+            'POST',
+            `/api/apps/discovery/${started.json().id}/complete`,
+            { token: 'synthetic-readiness-token', accountName: 'Synthetic readiness' },
+          );
+          assert.equal(completed.statusCode, 200, completed.body);
+          connection = (
+            await pool.query(
+              'SELECT id,service,paths FROM discovered_connections WHERE owner_id=$1 AND name=$2',
+              [ownerId, 'Synthetic readiness'],
+            )
+          ).rows[0];
+          assert.ok(connection);
+          assert.equal(connection.paths[0]!.endpoint, endpoint);
+          confirmationModel = (input) => {
+            const data = input.data as {
+              action: string;
+              details: { account: { endpoint: string } };
+            };
+            assert.equal(data.action, 'CONNECTED_MCP_CALL');
+            assert.equal(data.details.account.endpoint, endpoint);
+            return input.purpose === 'confirmation_review'
+              ? {
+                  valid:
+                    input.text === `Can I check ${endpoint}?` &&
+                    JSON.stringify(input.literalValues) === JSON.stringify([endpoint]),
+                }
+              : { text: `Can I check ${endpoint}?`, action: 'Check service' };
+          };
+          const args = {
+            connectionId: connection.id,
+            pathId: connection.paths[0]!.id,
+            tool: 'readiness_check',
+            input: {},
+          };
+          const held = await propose('CONNECTED_MCP_CALL', args, 'apps');
+          const [card] = await approvalsFor(held);
+          assert.equal(card.status, 'pending');
+          assert.deepEqual(card.args, args);
+          assert.equal(calls, 0);
+          repeatAfterConfirm = { action: 'CONNECTED_MCP_CALL', args };
+          const response = await request('POST', '/api/messages', {
+            text: 'Yes',
+            replyToMessageId: card.confirmation_message_id,
+            approvalAnswer: { approvalId: card.id, approved: true },
+          });
+          assert.equal(response.statusCode, 200, response.body);
+          await waitFor(response.json().turnId, 'succeeded');
+          const saved = (await approvalsFor(held))[0];
+          assert.equal(saved.status, 'completed');
+          assert.match(JSON.stringify(saved.result), /Synthetic service is ready/);
+          assert.equal(calls, 1);
+          assert.deepEqual([...requestPaths], ['/tools(v2)']);
+          assert.deepEqual(saved.args, args);
+        } finally {
+          confirmationModel = undefined;
+          repeatAfterConfirm = undefined;
+          if (connection)
+            await request(
+              'POST',
+              `/api/apps/${connection.service}/accounts/${connection.id}/disconnect`,
+            );
+          server.closeAllConnections();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+      });
+      await t.test('Stop cancels private entry in running and waiting turns', async () => {
+        const origin = 'https://bank.example.test';
+        const input = {
+          origin,
+          label: 'Synthetic cancellation login',
+          kind: 'password',
+          passwordSelector: '@password',
+          submitSelector: '@submit',
+          message: 'Enter the synthetic password.',
+        };
+        const before = injected.length;
+        let login: string | undefined;
+        for (const source of ['form', 'saved', 'card']) {
+          if (source === 'saved') {
+            const saved = await request('POST', '/api/vault', {
+              origin,
+              label: 'Synthetic cancellation login',
+              username: 'synthetic@example.test',
+              password: 'Synthetic cancellation password',
+            });
+            assert.equal(saved.statusCode, 200, saved.body);
+            login = saved.json().id;
+          }
+          let card: string | undefined;
+          if (source === 'card') {
+            const saved = await request('POST', '/api/vault', {
+              kind: 'card',
+              label: 'Synthetic cancellation card',
+              cardholder: 'Synthetic owner',
+              cardNumber: '4111111111111111',
+              expiryMonth: 12,
+              expiryYear: new Date().getUTCFullYear() + 3,
+            });
+            assert.equal(saved.statusCode, 200, saved.body);
+            card = saved.json().id;
+          }
+          const cardsBefore = filledCards.length;
+          let release!: () => void;
+          let entered = false;
+          let signal: AbortSignal | undefined;
+          privateEntryWait = {
+            entered(value) {
+              signal = value;
+              entered = true;
+            },
+            release: new Promise<void>((resolve) => {
+              release = resolve;
+            }),
+          };
+          let consumption:
+            ReturnType<typeof request> | Promise<Awaited<ReturnType<typeof request>>> | undefined;
+          let token: string | undefined;
+          try {
+            const text = `Sign in with the synthetic ${source} login ${randomUUID()}`;
+            asked.add(text);
+            plans.set(text, {
+              tool: source === 'card' ? 'pay' : 'sign_in',
+              action: 'Enter saved login',
+              args:
+                source === 'card'
+                  ? {
+                      amount: '12.34',
+                      currency: 'EUR',
+                      card,
+                      fields: { number: '@number', expiry: '@expiry' },
+                      submitSelector: '@submit',
+                    }
+                  : { ...input, ...(login ? { savedLoginId: login } : {}) },
+            });
+            const response = await request('POST', '/api/messages', { text });
+            assert.equal(response.statusCode, 200, response.body);
+            const turnId = response.json().turnId as string;
+            if (source !== 'saved') {
+              await waitFor(turnId, 'waiting');
+              const messages = JSON.stringify(
+                (
+                  await pool.query('SELECT text,presentation FROM messages WHERE turn_id=$1', [
+                    turnId,
+                  ])
+                ).rows,
+              );
+              token = (
+                source === 'card' ? /\/payments\/([a-f0-9-]{36})/ : /\/vault\/([A-Za-z0-9_-]{43})/
+              ).exec(messages)?.[1];
+              assert.ok(token);
+              consumption = request(
+                'POST',
+                source === 'card'
+                  ? `/api/payment-requests/${token}`
+                  : `/api/credential-requests/${token}`,
+                source === 'card'
+                  ? { code: '737' }
+                  : { password: 'Synthetic cancellation password' },
+              ).then((result) => result);
+            }
+            for (let attempt = 0; !entered && attempt < 300; attempt++) await delay(20);
+            assert.equal(entered, true);
+            assert.ok(signal);
+            assert.equal(signal.aborted, false);
+            assert.equal((await request('POST', '/api/thread/stop')).statusCode, 200);
+            assert.equal(signal.aborted, true);
+            release();
+            if (consumption) {
+              const result = await consumption;
+              assert.equal(result.statusCode, source === 'card' ? 409 : 502, result.body);
+              assert.equal(
+                (
+                  await request(
+                    'POST',
+                    source === 'card'
+                      ? `/api/payment-requests/${token}`
+                      : `/api/credential-requests/${token}`,
+                    source === 'card'
+                      ? { code: '737' }
+                      : { password: 'Synthetic cancellation password' },
+                  )
+                ).statusCode,
+                409,
+              );
+            }
+            await waitFor(turnId, 'cancelled');
+            let status: string | undefined;
+            for (let attempt = 0; status !== 'uncertain' && attempt < 300; attempt++) {
+              status = (
+                await pool.query(
+                  source === 'card'
+                    ? 'SELECT status FROM vault_uses WHERE id=$1'
+                    : 'SELECT status FROM vault_uses WHERE root_turn_id=$1',
+                  [source === 'card' ? token : turnId],
+                )
+              ).rows[0]?.status;
+              if (status !== 'uncertain') await delay(20);
+            }
+            assert.equal(status, 'uncertain');
+            assert.equal(injected.length, before);
+            assert.equal(filledCards.length, cardsBefore);
+            assert.equal(
+              (await pool.query('SELECT 1 FROM turns WHERE parent_turn_id=$1', [turnId])).rowCount,
+              0,
+            );
+          } finally {
+            release();
+            await consumption;
+            privateEntryWait = undefined;
+          }
+        }
+        const text = `Use the synthetic saved login again ${randomUUID()}`;
+        asked.add(text);
+        await propose('Enter saved login', { ...input, savedLoginId: login }, 'sign_in', text);
+        assert.equal(injected.length, before + 1);
+      });
       await t.test(
         'saved login consent keeps the account name and enters a code only with exact-origin consent',
         async () => {
@@ -3759,6 +5566,393 @@ test(
         },
       );
 
+      await t.test('a root login approval does not approve its www destination', async (t) => {
+        const previousOrigin = browserOrigin;
+        const previousUrl = browserUrl;
+        t.after(() => {
+          browserOrigin = previousOrigin;
+          browserUrl = previousUrl;
+          repeatAfterConfirm = undefined;
+        });
+        const origin = 'https://example.org:8443';
+        const destination = 'https://www.example.org:8443';
+        const saved = await request('POST', '/api/vault', {
+          label: 'Synthetic www account',
+          origin,
+          username: 'synthetic-owner@example.test',
+          password: 'synthetic-www-private-password',
+        });
+        assert.equal(saved.statusCode, 200, saved.body);
+        const login = saved.json().id as string;
+        const original = (
+          await pool.query('SELECT origin,ciphertext FROM vault_entries WHERE id=$1', [login])
+        ).rows[0];
+        const input = {
+          origin,
+          label: 'Synthetic www account',
+          message: 'Sign in to the synthetic website.',
+          kind: 'password',
+          usernameSelector: '@username',
+          passwordSelector: '@password',
+          submitSelector: '@submit',
+        };
+        browserOrigin = origin;
+        browserUrl = `${origin}/login`;
+        const before = injected.length;
+        const held = await propose('Enter saved login', input, 'sign_in');
+        const [rootCard] = await approvalsFor(held);
+        assert.deepEqual(rootCard.args, { origin, kind: 'sign_in', itemId: login });
+        assert.equal(injected.length, before);
+        browserOrigin = destination;
+        browserUrl = `${destination}/login`;
+        const wwwInput = { ...input, origin: destination };
+        repeatAfterConfirm = { tool: 'sign_in', action: 'Enter saved login', args: wwwInput };
+        const rootApproval = await request('POST', '/api/messages', {
+          text: 'Sign in',
+          replyToMessageId: rootCard.confirmation_message_id,
+          clientMessageId: randomUUID(),
+          approvalAnswer: { approvalId: rootCard.id, approved: true },
+        });
+        assert.equal(rootApproval.statusCode, 200, rootApproval.body);
+        await waitFor(rootApproval.json().turnId, 'waiting');
+        const [wwwCard] = await approvalsFor(rootApproval.json().turnId);
+        assert.equal(wwwCard?.action, 'NOD_vault_allow');
+        assert.deepEqual(wwwCard.args, { origin: destination, kind: 'sign_in', itemId: login });
+        assert.equal((await approvalsFor(held))[0].status, 'completed');
+        assert.equal(injected.length, before);
+        const destinations = [
+          ...(await confirmationFor(wwwCard)).matchAll(/https?:\/\/[^\s`]+/g),
+        ].map(([url]) => new URL(url).origin);
+        assert.deepEqual(destinations, [destination]);
+        repeatAfterConfirm = { tool: 'sign_in', action: 'Enter saved login', args: wwwInput };
+        const answer = {
+          text: 'Sign in',
+          replyToMessageId: wwwCard.confirmation_message_id,
+          clientMessageId: randomUUID(),
+          approvalAnswer: { approvalId: wwwCard.id, approved: true },
+        };
+        const wwwApproval = await request('POST', '/api/messages', answer);
+        assert.equal(wwwApproval.statusCode, 200, wwwApproval.body);
+        await waitFor(wwwApproval.json().turnId, 'succeeded');
+        assert.deepEqual(
+          (await request('POST', '/api/messages', answer)).json(),
+          wwwApproval.json(),
+        );
+        assert.equal(injected.length, before + 1);
+        assert.equal(injected.at(-1)?.origin, destination);
+        assert.equal(injected.at(-1)?.password, 'synthetic-www-private-password');
+        assert.doesNotMatch(
+          JSON.stringify(results.get(wwwApproval.json().turnId)),
+          /synthetic-www-private-password/,
+        );
+        assert.deepEqual(
+          (await pool.query('SELECT origin,kind,status FROM vault_uses WHERE item_id=$1', [login]))
+            .rows,
+          [{ origin: destination, kind: 'password', status: 'submitted' }],
+        );
+        assert.deepEqual(
+          (await pool.query('SELECT origin,ciphertext FROM vault_entries WHERE id=$1', [login]))
+            .rows[0],
+          original,
+        );
+      });
+
+      await t.test(
+        'an explicit MCP workflow repeat asks again and returns the new execution',
+        async () => {
+          const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+          const { StreamableHTTPServerTransport } =
+            await import('@modelcontextprotocol/sdk/server/streamableHttp.js');
+          const { z } = await import('zod');
+          let threshold = 3;
+          const updates: number[] = [];
+          const executions: Array<{ executionId: string; threshold: number }> = [];
+          const server = createServer(async (request, response) => {
+            const mcp = new McpServer({ name: 'synthetic-workflow', version: '1' });
+            mcp.registerTool(
+              'update_workflow',
+              {
+                description: 'Set the threshold in the named synthetic workflow.',
+                inputSchema: { workflowId: z.string(), threshold: z.number() },
+              },
+              async (input) => {
+                assert.equal(input.workflowId, 'synthetic-workflow');
+                threshold = input.threshold;
+                updates.push(threshold);
+                return { content: [{ type: 'text', text: JSON.stringify({ threshold }) }] };
+              },
+            );
+            mcp.registerTool(
+              'execute_workflow',
+              {
+                description: 'Run the named synthetic workflow once.',
+                inputSchema: { workflowId: z.string() },
+              },
+              async ({ workflowId }) => {
+                assert.equal(workflowId, 'synthetic-workflow');
+                const result = { executionId: `synthetic-${executions.length + 1}`, threshold };
+                executions.push(result);
+                return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+              },
+            );
+            const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+            response.on('close', () => void transport.close());
+            await mcp.connect(transport);
+            await transport.handleRequest(request, response);
+          });
+          await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+          let connectionId: string | undefined;
+          let connectionService: string | undefined;
+          try {
+            const endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}/mcp`;
+            const setup = await request('POST', '/api/apps/mcp', {
+              name: 'Synthetic workflow',
+              endpoint,
+              auth: 'bearer',
+            });
+            assert.equal(setup.statusCode, 200, setup.body);
+            const connected = await request(
+              'POST',
+              `/api/apps/discovery/${setup.json().id}/complete`,
+              { token: 'synthetic-mcp-token', accountName: 'Synthetic workspace' },
+            );
+            assert.equal(connected.statusCode, 200, connected.body);
+            const account = (
+              await pool.query(
+                'SELECT id,service FROM discovered_connections WHERE owner_id=$1 AND name=$2',
+                [ownerId, 'Synthetic workflow'],
+              )
+            ).rows[0];
+            connectionId = account.id;
+            connectionService = account.service;
+            const input = { workflowId: 'synthetic-workflow' };
+            const initial = await propose(
+              'execute_workflow',
+              input,
+              'synthetic_mcp',
+              'Run the synthetic workflow for the first time.',
+            );
+            const [first] = await approvalsFor(initial);
+            assert.equal(first.action, 'CONNECTED_MCP_CALL');
+            assert.equal(executions.length, 0);
+            const question =
+              'Which threshold should I use for a new run of the synthetic workflow?';
+            questionAfterConfirm = question;
+            const accepted = await request('POST', '/api/messages', {
+              text: 'Run workflow',
+              replyToMessageId: first.confirmation_message_id,
+              approvalAnswer: { approvalId: first.id, approved: true },
+            });
+            assert.equal(accepted.statusCode, 200, accepted.body);
+            await waitFor(accepted.json().turnId, 'waiting');
+            assert.deepEqual(executions, [{ executionId: 'synthetic-1', threshold: 3 }]);
+            const savedFirst = (await approvalsFor(initial))[0];
+            assert.equal(savedFirst.status, 'completed');
+            const savedQuestion = (
+              await pool.query(
+                "SELECT id FROM messages WHERE turn_id=$1 AND role='assistant' AND text=$2",
+                [accepted.json().turnId, question],
+              )
+            ).rows[0];
+            assert.ok(savedQuestion);
+            const reply = 'Set the threshold to 7 and run the synthetic workflow again.';
+            workflowUpdate = { workflowId: 'synthetic-workflow', threshold: 7 };
+            asked.add(reply);
+            plans.set(reply, { tool: 'synthetic_mcp', action: 'execute_workflow', args: input });
+            repeatDecision = 'new';
+            let repeatEntered!: () => void;
+            const checkingRepeat = new Promise<void>((resolve) => {
+              repeatEntered = resolve;
+            });
+            let releaseRepeat!: () => void;
+            const repeatReady = new Promise<void>((resolve) => {
+              releaseRepeat = resolve;
+            });
+            holdRepeatCheck = async () => {
+              repeatEntered();
+              await repeatReady;
+            };
+            const commandsBefore = workspaceDispatches.length;
+            parallelRepeatWork = async (options) => {
+              parallelRepeatWork = undefined;
+              await checkingRepeat;
+              const queued = options.runTool(
+                'bash',
+                { command: 'cat synthetic-repeat.txt' },
+                async () => {
+                  workspaceDispatches.push('synthetic-repeat');
+                  return { content: [] };
+                },
+              );
+              try {
+                await delay(30);
+                assert.equal(workspaceDispatches.length, commandsBefore);
+              } finally {
+                releaseRepeat();
+                holdRepeatCheck = undefined;
+                await queued.catch(() => {});
+              }
+            };
+            const repeated = await request('POST', '/api/messages', {
+              text: reply,
+              replyToMessageId: savedQuestion.id,
+            });
+            assert.equal(repeated.statusCode, 200, repeated.body);
+            await waitFor(repeated.json().turnId, 'waiting|succeeded');
+            const [second] = await approvalsFor(repeated.json().turnId);
+            assert.ok(second, 'A new explicit run must save a new confirmation.');
+            assert.equal(second.status, 'pending');
+            assert.equal(second.source_message_id, repeated.json().messageId);
+            assert.deepEqual(second.args, first.args);
+            assert.equal(executions.length, 1);
+            assert.equal(workspaceDispatches.length, commandsBefore);
+            assert.deepEqual(updates, [7]);
+            assert.equal(threshold, 7);
+            assert.deepEqual(second.details.account, {
+              name: 'Synthetic workflow',
+              identity: 'Synthetic workspace',
+              method: 'mcp',
+              endpoint,
+            });
+            assert.equal(second.details.tool.name, 'execute_workflow');
+            assert.deepEqual(second.details.tool, first.details.tool);
+            assert.equal(second.details.verifiedBinding, first.details.verifiedBinding);
+            assert.deepEqual(repeatChecks.at(-1), {
+              action: 'CONNECTED_MCP_CALL',
+              args: first.args,
+              reply,
+              question,
+            });
+            assert.ok(ownerWords.includes(reply));
+            repeatAfterConfirm = { tool: 'synthetic_mcp', action: 'execute_workflow', args: input };
+            const thirdQuestion = 'Should I run the synthetic workflow a third time?';
+            questionAfterConfirm = thirdQuestion;
+            const answer = {
+              text: 'Run workflow',
+              replyToMessageId: second.confirmation_message_id,
+              clientMessageId: randomUUID(),
+              approvalAnswer: { approvalId: second.id, approved: true },
+            };
+            const approved = await request('POST', '/api/messages', answer);
+            assert.equal(approved.statusCode, 200, approved.body);
+            await waitFor(approved.json().turnId, 'waiting');
+            assert.deepEqual(
+              (await request('POST', '/api/messages', answer)).json(),
+              approved.json(),
+            );
+            assert.deepEqual(executions, [
+              { executionId: 'synthetic-1', threshold: 3 },
+              { executionId: 'synthetic-2', threshold: 7 },
+            ]);
+            assert.match(JSON.stringify(results.get(approved.json().turnId)), /synthetic-2/);
+            assert.doesNotMatch(JSON.stringify(results.get(approved.json().turnId)), /synthetic-1/);
+            assert.deepEqual((await approvalsFor(initial))[0].result, savedFirst.result);
+            assert.match(
+              JSON.stringify((await approvalsFor(repeated.json().turnId))[0].result),
+              /synthetic-2/,
+            );
+            const ledger = (
+              await pool.query(
+                "SELECT basis FROM app_actions WHERE owner_id=$2 AND turn_id=ANY($1::uuid[]) AND action='CONNECTED_MCP_CALL'",
+                [[accepted.json().turnId, approved.json().turnId], ownerId],
+              )
+            ).rows;
+            assert.equal(ledger.length, 2);
+            assert.deepEqual(
+              ledger.map((row) => row.basis),
+              [{ kind: 'approved' }, { kind: 'approved' }],
+            );
+            const cards = await request(
+              'GET',
+              `/api/messages/around/${second.confirmation_message_id}`,
+            );
+            assert.equal(cards.statusCode, 200, cards.body);
+            assert.equal(
+              cards
+                .json()
+                .find((message: { id: string }) => message.id === second.confirmation_message_id)
+                .approval.state,
+              'done',
+            );
+            const thirdQuestionId = (
+              await pool.query(
+                "SELECT id FROM messages WHERE turn_id=$1 AND role='assistant' AND text=$2",
+                [approved.json().turnId, thirdQuestion],
+              )
+            ).rows[0].id;
+            const thirdReply = 'Run the synthetic workflow a third time.';
+            plans.set(thirdReply, {
+              tool: 'synthetic_mcp',
+              action: 'execute_workflow',
+              args: input,
+            });
+            asked.add(thirdReply);
+            repeatDecision = 'uncertain';
+            const third = await request('POST', '/api/messages', {
+              text: thirdReply,
+              replyToMessageId: thirdQuestionId,
+            });
+            assert.equal(third.statusCode, 200, third.body);
+            await waitFor(third.json().turnId, 'failed');
+            const failed = (
+              await pool.query('SELECT error FROM turns WHERE id=$1', [third.json().turnId])
+            ).rows[0];
+            assert.match(failed.error, /did not run again/);
+            assert.equal(results.has(third.json().turnId), false);
+            assert.deepEqual(await approvalsFor(third.json().turnId), []);
+            assert.equal(executions.length, 2);
+            assert.deepEqual(updates, [7]);
+            assert.deepEqual((await approvalsFor(initial))[0].result, savedFirst.result);
+            let visibleError = false;
+            for (let attempt = 0; attempt < 300; attempt++) {
+              const visible = await request(
+                'GET',
+                `/api/messages/around/${third.json().messageId}`,
+              );
+              assert.equal(visible.statusCode, 200, visible.body);
+              visibleError = visible
+                .json()
+                .some(
+                  (message: { role: string; turnId: string; text: string }) =>
+                    message.role === 'assistant' &&
+                    message.turnId === third.json().turnId &&
+                    message.text.includes('did not run again'),
+                );
+              if (visibleError) break;
+              await delay(20);
+            }
+            assert.equal(visibleError, true, 'The chat must show the specific repeat refusal.');
+            assert.equal(
+              (
+                await pool.query('SELECT 1 FROM app_actions WHERE turn_id=$1', [
+                  third.json().turnId,
+                ])
+              ).rowCount,
+              0,
+            );
+          } finally {
+            holdRepeatCheck = undefined;
+            parallelRepeatWork = undefined;
+            questionAfterConfirm = undefined;
+            workflowUpdate = undefined;
+            repeatAfterConfirm = undefined;
+            repeatDecision = 'same';
+            if (connectionId)
+              assert.equal(
+                (
+                  await request(
+                    'POST',
+                    `/api/apps/${connectionService}/accounts/${connectionId}/disconnect`,
+                    {},
+                  )
+                ).statusCode,
+                200,
+              );
+            server.closeAllConnections();
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+          }
+        },
+      );
       await t.test(
         'a connect whose sign-in label cannot be written leaves no attempt behind',
         async () => {
@@ -3880,7 +6074,7 @@ test(
           const [held] = await approvalsFor(unnamed);
           assert.equal(held.status, 'pending');
           assert.equal(held.action, 'LOCAL_FILES_READ');
-          assert.deepEqual(held.args, { path: join(folder, 'contract.txt') });
+          assert.equal(held.args.path, join(folder, 'contract.txt'));
           const schedule = await reminder();
           const scheduledPrompt = `Synthetic scheduled listing ${randomUUID()}`;
           plans.set(scheduledPrompt, { tool: 'files', action: 'list', args: { path: folder } });
@@ -3952,6 +6146,327 @@ test(
         },
       );
       await t.test(
+        'changed and legacy local reads return no result and permit a fresh checked read',
+        async () => {
+          await request('PATCH', '/api/preferences', { localFilesEnabled: true });
+          const folder = await mkdtemp(join(localHome, 'changed-read-'));
+          for (const action of ['read', 'import'])
+            for (const legacy of [false, true]) {
+              const path = join(folder, `${randomUUID()}.txt`);
+              await writeFile(path, 'Original synthetic bytes');
+              const text = `Read the synthetic file ${randomUUID()}`;
+              const opening = await propose(action, { path }, 'files', text);
+              const [approval] = await approvalsFor(opening);
+              if (legacy)
+                await pool.query("UPDATE approvals SET args=args-'version' WHERE id=$1", [
+                  approval.id,
+                ]);
+              await writeFile(path, 'Current synthetic bytes');
+              const beforeFiles = new Set(workspaceFiles.keys());
+              asked.add(text);
+              repeatAfterConfirm = { tool: 'files', action, args: { path } };
+              const accepted = await request('POST', '/api/messages', {
+                text: 'Yes',
+                replyToMessageId: approval.confirmation_message_id,
+                approvalAnswer: { approvalId: approval.id, approved: true },
+              });
+              assert.equal(accepted.statusCode, 200, accepted.body);
+              const resumed = accepted.json().turnId;
+              await waitFor(resumed, 'succeeded');
+              const [saved] = await approvalsFor(opening);
+              assert.equal(saved.status, 'expired');
+              assert.match(saved.result.error, legacy ? /no checked version/ : /changed after/);
+              assert.doesNotMatch(
+                JSON.stringify(saved.result),
+                /Original synthetic bytes|Current synthetic bytes/,
+              );
+              assert.equal(repeatAfterConfirm, undefined);
+              if (action === 'read')
+                assert.ok(JSON.stringify(results.get(resumed)).includes('Current synthetic bytes'));
+              else {
+                const imported = [...workspaceFiles.keys()].filter((key) => !beforeFiles.has(key));
+                assert.equal(imported.length, 1);
+                assert.equal(
+                  Buffer.from(workspaceFiles.get(imported[0]!)!).toString(),
+                  'Current synthetic bytes',
+                );
+              }
+              assert.deepEqual(await approvalsFor(resumed), []);
+            }
+        },
+      );
+      await t.test(
+        'a failed approved file open permits a fresh read in the same request',
+        async () => {
+          const folder = await mkdtemp(join(localHome, 'failed-open-'));
+          for (const action of ['read', 'import']) {
+            const path = join(folder, `${action}.txt`);
+            await writeFile(path, 'Original synthetic bytes');
+            const text = `Open the synthetic file ${randomUUID()}`;
+            const opening = await propose(action, { path }, 'files', text);
+            const [approval] = await approvalsFor(opening);
+            const originalOpen = fs.open;
+            let failed = false;
+            const intercepted = t.mock.method(
+              fs,
+              'open',
+              async (...args: Parameters<typeof fs.open>) => {
+                if (args[0] === path && !failed) {
+                  failed = true;
+                  await writeFile(path, 'Current synthetic bytes');
+                  throw Object.assign(new Error('EIO: synthetic file open failed'), {
+                    statusCode: 503,
+                  });
+                }
+                return Reflect.apply(originalOpen, fs, args);
+              },
+            );
+            syncBuiltinESMExports();
+            const beforeFiles = new Set(workspaceFiles.keys());
+            try {
+              asked.add(text);
+              repeatAfterConfirm = { tool: 'files', action, args: { path } };
+              const accepted = await request('POST', '/api/messages', {
+                text: 'Yes',
+                replyToMessageId: approval.confirmation_message_id,
+                approvalAnswer: { approvalId: approval.id, approved: true },
+              });
+              assert.equal(accepted.statusCode, 200, accepted.body);
+              const resumed = accepted.json().turnId;
+              await waitFor(resumed, 'succeeded');
+              const [saved] = await approvalsFor(opening);
+              assert.equal(failed, true);
+              assert.equal(saved.status, 'expired');
+              assert.match(saved.result.error, /EIO: synthetic file open failed/);
+              assert.doesNotMatch(JSON.stringify(saved.result), /synthetic bytes/);
+              assert.equal(repeatAfterConfirm, undefined);
+              if (action === 'read')
+                assert.match(JSON.stringify(results.get(resumed)), /Current synthetic bytes/);
+              else {
+                const imported = [...workspaceFiles.keys()].filter((key) => !beforeFiles.has(key));
+                assert.equal(imported.length, 1);
+                assert.equal(
+                  Buffer.from(workspaceFiles.get(imported[0]!)!).toString(),
+                  'Current synthetic bytes',
+                );
+              }
+              assert.deepEqual(await approvalsFor(resumed), []);
+            } finally {
+              repeatAfterConfirm = undefined;
+              intercepted.mock.restore();
+              syncBuiltinESMExports();
+            }
+          }
+        },
+      );
+      await t.test(
+        'a file path check failure after reading keeps the uncertain repeat fence',
+        async () => {
+          const enabled = await request('PATCH', '/api/preferences', { localFilesEnabled: true });
+          assert.equal(enabled.statusCode, 200, enabled.body);
+          const folder = await mkdtemp(join(localHome, 'uncertain-read-'));
+          for (const action of ['read', 'import']) {
+            const path = join(folder, `${action}.txt`);
+            await writeFile(path, 'Original synthetic bytes');
+            const text = `Open the synthetic file ${randomUUID()}`;
+            const opening = await propose(action, { path }, 'files', text);
+            const [approval] = await approvalsFor(opening);
+            assert.equal(
+              approval.action,
+              action === 'read' ? 'LOCAL_FILES_READ' : 'LOCAL_FILES_IMPORT',
+            );
+            const originalOpen = fs.open;
+            const originalLstat = fs.lstat;
+            let reads = 0;
+            let failed = false;
+            const restoreReads: Array<() => void> = [];
+            const opened = t.mock.method(
+              fs,
+              'open',
+              async (...args: Parameters<typeof fs.open>) => {
+                const file = await Reflect.apply(originalOpen, fs, args);
+                if (args[0] === path) {
+                  const originalRead = file.read;
+                  const intercepted = t.mock.method(
+                    file,
+                    'read',
+                    async (...input: Parameters<typeof file.read>) => {
+                      const result = await Reflect.apply(originalRead, file, input);
+                      reads++;
+                      return result;
+                    },
+                  );
+                  restoreReads.push(() => intercepted.mock.restore());
+                }
+                return file;
+              },
+            );
+            const checked = t.mock.method(
+              fs,
+              'lstat',
+              async (...args: Parameters<typeof fs.lstat>) => {
+                if (args[0] === path && args[1]?.bigint && reads === 1 && !failed) {
+                  failed = true;
+                  await writeFile(path, 'Current synthetic bytes');
+                  throw Object.assign(new Error('EIO: synthetic post-read path check failed'), {
+                    statusCode: 503,
+                  });
+                }
+                return Reflect.apply(originalLstat, fs, args);
+              },
+            );
+            syncBuiltinESMExports();
+            const beforeFiles = new Set(workspaceFiles.keys());
+            try {
+              asked.add(text);
+              repeatAfterConfirm = { tool: 'files', action, args: { path } };
+              const accepted = await request('POST', '/api/messages', {
+                text: 'Yes',
+                replyToMessageId: approval.confirmation_message_id,
+                approvalAnswer: { approvalId: approval.id, approved: true },
+              });
+              assert.equal(accepted.statusCode, 200, accepted.body);
+              const resumed = accepted.json().turnId;
+              await waitFor(resumed, 'failed');
+              const [saved] = await approvalsFor(opening);
+              assert.equal(failed, true);
+              assert.equal(saved.status, 'uncertain');
+              assert.match(saved.result.error, /EIO: synthetic post-read path check failed/);
+              assert.doesNotMatch(JSON.stringify(saved.result), /synthetic bytes/);
+              assert.equal(repeatAfterConfirm, undefined);
+              const failedTurn = (
+                await pool.query('SELECT error FROM turns WHERE id=$1', [resumed])
+              ).rows[0];
+              assert.match(failedTurn.error, /pending or uncertain outcome/);
+              assert.equal(reads, 1);
+              assert.deepEqual(
+                [...workspaceFiles.keys()].filter((key) => !beforeFiles.has(key)),
+                [],
+              );
+              assert.deepEqual(await approvalsFor(resumed), []);
+            } finally {
+              repeatAfterConfirm = undefined;
+              restoreReads.forEach((restore) => restore());
+              opened.mock.restore();
+              checked.mock.restore();
+              syncBuiltinESMExports();
+            }
+          }
+        },
+      );
+      await t.test('confirmed local reads observe edits in the same request', async () => {
+        await request('PATCH', '/api/preferences', { localFilesEnabled: true });
+        const folder = await mkdtemp(join(localHome, 'reread-'));
+        for (const replacement of ['b'.repeat(859), 'a'.repeat(280)]) {
+          const path = join(folder, `${randomUUID()}.md`);
+          const original = 'a'.repeat(280) + '\nRemove this synthetic line after the table.\n';
+          await writeFile(path, original);
+          const text = `Check the synthetic note ${randomUUID()}`;
+          const opening = await propose('read', { path }, 'files', text);
+          const [approval] = await approvalsFor(opening);
+          assert.equal(approval.action, 'LOCAL_FILES_READ');
+          asked.add(text);
+          repeatAfterConfirm = [
+            {
+              tool: 'files',
+              action: 'edit',
+              args: { path, edits: [{ oldText: original, newText: replacement }] },
+            },
+            { tool: 'files', action: 'read', args: { path } },
+          ];
+          const accepted = await request('POST', '/api/messages', {
+            text: 'Yes',
+            replyToMessageId: approval.confirmation_message_id,
+            approvalAnswer: { approvalId: approval.id, approved: true },
+          });
+          assert.equal(accepted.statusCode, 200, accepted.body);
+          const resumed = accepted.json().turnId;
+          await waitFor(resumed, 'succeeded');
+          assert.equal(await readFile(path, 'utf8'), replacement);
+          const result = JSON.stringify(results.get(resumed));
+          assert.ok(result.includes(replacement), result);
+          assert.ok(!result.includes('Remove this synthetic line'), result);
+          const [saved] = await approvalsFor(opening);
+          assert.equal(saved.id, approval.id);
+          assert.equal(saved.status, 'completed');
+          assert.equal(saved.result.text, original);
+          assert.deepEqual(await approvalsFor(resumed), []);
+        }
+      });
+      await t.test(
+        'local Markdown approvals preserve the reviewed path through execution',
+        async () => {
+          const folder = await mkdtemp(join(localHome, 'markdown-'));
+          const path = join(folder, 'Next Actions.md');
+          const contents = 'Synthetic next action: review the fixture.';
+          await writeFile(path, contents);
+          let draftPath = path;
+          let reviews = 0;
+          let reviewedArgs: { path: string; version: string } | undefined;
+          confirmationModel = (input) => {
+            const data = input.data as { action: string; args: { path: string; version: string } };
+            assert.ok(['LOCAL_FILES_READ', 'LOCAL_FILES_IMPORT'].includes(data.action));
+            assert.equal(data.args.path, path);
+            assert.match(data.args.version, /^[a-f0-9]{64}$/);
+            assert.deepEqual(Object.keys(data.args).sort(), ['path', 'version']);
+            const operation = data.action === 'LOCAL_FILES_READ' ? 'read' : 'import';
+            if (input.purpose === 'confirmation_review') {
+              assert.deepEqual(data.args, reviewedArgs);
+              reviews++;
+              return input.text === `Can I ${operation} ${path}?`
+                ? { valid: true }
+                : { valid: false, reason: 'The question names a different path.' };
+            }
+            reviewedArgs = structuredClone(data.args);
+            return { text: `Can I ${operation} ${draftPath}?`, action: 'Open file' };
+          };
+          try {
+            for (const action of ['read', 'import']) {
+              const before = new Set(workspaceFiles.keys());
+              const opening = await propose(action, { path }, 'files');
+              const [approval] = await approvalsFor(opening);
+              assert.equal(approval.status, 'pending');
+              assert.deepEqual(approval.args, reviewedArgs);
+              assert.doesNotMatch(JSON.stringify(results.get(opening)), /Synthetic next action/);
+              assert.deepEqual([...workspaceFiles.keys()], [...before]);
+              const response = await request('POST', '/api/messages', {
+                text: 'Yes',
+                replyToMessageId: approval.confirmation_message_id,
+                approvalAnswer: { approvalId: approval.id, approved: true },
+              });
+              assert.equal(response.statusCode, 200, response.body);
+              await waitFor(response.json().turnId, 'succeeded');
+              assert.equal((await approvalsFor(opening))[0].status, 'completed');
+              const stored = (await approvalsFor(opening))[0].result;
+              if (action === 'read') assert.match(JSON.stringify(stored), /Synthetic next action/);
+              else {
+                const imported = [...workspaceFiles.keys()].filter((file) => !before.has(file));
+                assert.equal(imported.length, 1);
+                assert.equal(Buffer.from(workspaceFiles.get(imported[0]!)!).toString(), contents);
+              }
+              assert.equal(await readFile(path, 'utf8'), contents);
+            }
+            draftPath = join(folder, 'Different.md');
+            const prompt = `Synthetic changed Markdown path ${randomUUID()}`;
+            plans.set(prompt, { tool: 'files', action: 'read', args: { path } });
+            const response = await request('POST', '/api/messages', { text: prompt });
+            assert.equal(response.statusCode, 200, response.body);
+            const opening = response.json().turnId as string;
+            await waitFor(opening, 'succeeded|failed');
+            assert.deepEqual(await approvalsFor(opening), []);
+            const failed = (await pool.query('SELECT error FROM turns WHERE id=$1', [opening]))
+              .rows[0];
+            assert.match(
+              JSON.stringify(results.get(opening)) ?? failed.error,
+              /names a different path/,
+            );
+            assert.equal(reviews, 4);
+          } finally {
+            confirmationModel = undefined;
+          }
+        },
+      );
+      await t.test(
         'local files export imported workspace files and refuse changed approved bytes',
         async () => {
           const folder = await mkdtemp(join(localHome, 'exports-'));
@@ -3988,26 +6503,126 @@ test(
         },
       );
       await calendarRetry();
-      await t.test('shutdown saves usage from the last provider before it returns', async () => {
-        await pool.query(`
+      await t.test(
+        'shutdown cancels private entry and command admission before cleanup and saves final usage',
+        async () => {
+          await pool.query(`
           CREATE FUNCTION delay_closing_usage() RETURNS trigger LANGUAGE plpgsql AS $$
             BEGIN PERFORM pg_sleep(1); RETURN NEW; END;
           $$;
           CREATE TRIGGER delay_closing_usage BEFORE INSERT ON model_usage
             FOR EACH ROW WHEN (NEW.id='${closingUsageId}') EXECUTE FUNCTION delay_closing_usage()`);
-        recordClosingUsage = true;
-        try {
-          await application.app.close();
-          assert.deepEqual(
-            (await pool.query('SELECT cost_usd FROM model_usage WHERE id=$1', [closingUsageId]))
-              .rows,
-            [{ cost_usd: 0.125 }],
-          );
-        } finally {
-          recordClosingUsage = false;
-          await pool.query('DROP FUNCTION delay_closing_usage() CASCADE');
-        }
-      });
+          const closeModels = models.close;
+          let releaseModels!: () => void;
+          let modelsClosing!: () => void;
+          const modelCleanup = new Promise<void>((resolve) => {
+            releaseModels = resolve;
+          });
+          const cleanupEntered = new Promise<void>((resolve) => {
+            modelsClosing = resolve;
+          });
+          models.close = async () => {
+            modelsClosing();
+            await modelCleanup;
+            await closeModels();
+          };
+          let releaseEntry!: () => void;
+          let entryStarted = false;
+          let entrySignal: AbortSignal | undefined;
+          privateEntryWait = {
+            entered(signal) {
+              entryStarted = true;
+              entrySignal = signal;
+            },
+            release: new Promise<void>((resolve) => {
+              releaseEntry = resolve;
+            }),
+          };
+          let closingApplication: Promise<void> | undefined;
+          let releaseCommandReview = () => {};
+          let pendingCommand: Promise<AgentToolResult> | undefined;
+          const before = injected.length;
+          const commandsBefore = workspaceDispatches.length;
+          recordClosingUsage = true;
+          try {
+            const saved = await request('POST', '/api/vault', {
+              origin: 'https://bank.example.test',
+              label: 'Synthetic shutdown login',
+              username: 'shutdown@example.test',
+              password: 'Synthetic shutdown password',
+            });
+            assert.equal(saved.statusCode, 200, saved.body);
+            const text = `Use the synthetic shutdown login ${randomUUID()}`;
+            asked.add(text);
+            plans.set(text, {
+              tool: 'sign_in',
+              action: 'Enter saved login',
+              args: {
+                origin: 'https://bank.example.test',
+                label: 'Synthetic shutdown login',
+                kind: 'password',
+                savedLoginId: saved.json().id,
+                passwordSelector: '@password',
+                submitSelector: '@submit',
+                message: 'Use the synthetic login.',
+              },
+            });
+            const started = await request('POST', '/api/messages', { text });
+            assert.equal(started.statusCode, 200);
+            for (let attempt = 0; !entryStarted && attempt < 300; attempt++) await delay(20);
+            assert.equal(entryStarted, true);
+            assert.ok(entrySignal);
+            assert.equal(entrySignal.aborted, false);
+            let reviewEntered!: () => void;
+            const reviewing = new Promise<void>((resolve) => {
+              reviewEntered = resolve;
+            });
+            const holdReview = new Promise<void>((resolve) => {
+              releaseCommandReview = resolve;
+            });
+            workspaceReview = async () => {
+              reviewEntered();
+              await holdReview;
+              return { run: true, because: 'read' };
+            };
+            pendingCommand = runtimeCommands.get(started.json().turnId)!(
+              'bash',
+              { command: 'cat synthetic.txt' },
+              async () => {
+                workspaceDispatches.push('Synthetic late shutdown command');
+                return { content: [] };
+              },
+            );
+            await reviewing;
+            closingApplication = application.app.close();
+            await cleanupEntered;
+            assert.equal(entrySignal.aborted, true);
+            releaseCommandReview();
+            await pendingCommand.catch(() => {});
+            assert.equal(workspaceDispatches.length, commandsBefore);
+            releaseEntry();
+            releaseModels();
+            await closingApplication;
+            assert.equal(injected.length, before);
+            assert.deepEqual(
+              (await pool.query('SELECT cost_usd FROM model_usage WHERE id=$1', [closingUsageId]))
+                .rows,
+              [{ cost_usd: 0.125 }],
+            );
+          } finally {
+            releaseCommandReview();
+            workspaceReview = undefined;
+            await pendingCommand?.catch(() => {});
+            releaseEntry();
+            releaseModels();
+            await closingApplication;
+            models.close = closeModels;
+            privateEntryWait = undefined;
+            recordClosingUsage = false;
+            await pool.query('DROP FUNCTION delay_closing_usage() CASCADE');
+          }
+        },
+      );
     } finally {
       await application.app.close();
       await pool.end();

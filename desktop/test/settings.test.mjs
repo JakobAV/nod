@@ -988,6 +988,7 @@ async function runningDesktop(
       status: () => status,
       notifyReady: updateReadinessNotice,
       checkUpdates: (updater, manual = true, restartReady = false) => { updates = updater; return checkForUpdates(manual, restartReady); },
+      reportUpdateStatus,
       registerFiles: () => { ${source.slice(source.indexOf('      disposeArtifactFiles = registerArtifactFileHandlers('), source.indexOf("      ipcMain.handle('nod:renderer-ready'"))} },
       quit,
       quitApp: (install = true) => { installUpdateOnQuit = install; return quitApp(); },
@@ -3484,6 +3485,16 @@ test('quit requests install once, skip installer conflicts, and still close afte
     const candidate = mode === 'not-ready' ? undefined : { version: '0.10.0' };
     const f = await runningDesktop(t, async () => Response.json({}), {
       platform: 'win32',
+      prompt: (options) => {
+        assert.equal(mode, 'launch-failed');
+        assert.match(options.detail, /Synthetic PowerShell launch failure/);
+        assert.deepEqual(Array.from(options.buttons), [
+          'Retry installation',
+          'Download Nod',
+          'Quit without updating',
+        ]);
+        return { response: 2 };
+      },
       startWindowsInstall: async () => {
         installs++;
         if (mode === 'launch-failed') throw new Error('Synthetic PowerShell launch failure');
@@ -6944,7 +6955,7 @@ test('public GitHub metadata redirects resolve to verified Mac runtime and Windo
 });
 
 test(
-  'manual update failures fence concurrent requests and retry only after an explicit choice without exposing diagnostics',
+  'manual update failures fence concurrent requests and keep the safe reason until an explicit retry',
   { timeout: 10_000 },
   async (t) => {
     const failure = new Error(
@@ -6981,7 +6992,8 @@ test(
       assert.equal(checks, 1);
       assert.equal(prompts.length, 1);
       assert.equal(f.updateMenu.enabled, false);
-      assert.equal(JSON.stringify(prompts).includes('Synthetic updater transport failure'), false);
+      assert.match(prompts[0].detail, /Synthetic updater transport failure/);
+      assert.equal(prompts[0].detail.includes('updates.example.invalid'), false);
       decision.resolve({ response: 0 });
       await Promise.all([initial, duplicate, duringDialog]);
       assert.equal(checks, 2);
@@ -6999,7 +7011,7 @@ test(
   },
 );
 
-test('declining a manual update retry and failed background checks never repeat work or show background errors', async (t) => {
+test('declining a manual update retry and failed background checks never repeat work or open background dialogs', async (t) => {
   for (const manual of [true, false]) {
     let checks = 0;
     const prompts = [];
@@ -7012,7 +7024,7 @@ test('declining a manual update retry and failed background checks never repeat 
     const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
       prompt: (options) => {
         prompts.push(options);
-        return { response: 1 };
+        return { response: 2 };
       },
     });
     if (manual) await f.checkUpdates(updater);
@@ -7020,7 +7032,8 @@ test('declining a manual update retry and failed background checks never repeat 
       await assert.rejects(f.checkUpdates(updater, false), /Synthetic update service unavailable/);
     assert.equal(checks, 1);
     assert.equal(prompts.length, manual ? 1 : 0);
-    assert.equal(JSON.stringify(prompts).includes('Synthetic update service unavailable'), false);
+    if (manual) assert.match(prompts[0].detail, /Synthetic update service unavailable/);
+    assert.equal(f.externalURLs.length, 0);
     assert.equal(f.updateMenu.enabled, true);
   }
 });
@@ -7063,14 +7076,14 @@ test(
       const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
         prompt: (options) => {
           prompts.push(options);
-          return { response: prompts.length === 2 && !retry ? 1 : 0 };
+          return { response: prompts.length === 2 && !retry ? 2 : 0 };
         },
       });
       await f.checkUpdates(updater);
       assert.equal(restarts, retry ? 2 : 1);
       assert.equal(prompts.length, 2);
       assert.equal(updater.ready, candidate);
-      assert.equal(JSON.stringify(prompts).includes('Synthetic native restart failure'), false);
+      assert.match(prompts[1].detail, /Synthetic native restart failure/);
       if (!retry) {
         await f.checkUpdates(updater, true, true);
         assert.equal(restarts, 2);
@@ -8432,6 +8445,414 @@ test('artifact exports keep owned bytes, safe names, separate saves and restrict
     await files.dispose();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('manual update failures offer only the official download page without another update attempt', async (t) => {
+  let checks = 0;
+  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
+    prompt: () => ({ response: 1 }),
+  });
+  await f.checkUpdates({
+    check: async () => {
+      checks++;
+      throw new Error('The desktop update download timed out.');
+    },
+  });
+  assert.equal(checks, 1);
+  assert.deepEqual(f.externalURLs, ['https://nod.n8n.io/docs/get-started/install-desktop/']);
+});
+
+test('update release lookup and metadata failures keep their HTTP status', async () => {
+  const request = async () => new Response(null, { status: 503 });
+  await assert.rejects(createUpdateSource({ fetch: request }).latest('0.1.0'), /HTTP 503/);
+  await assert.rejects(
+    createUpdateSource({ sourceUrl: 'https://updates.example.invalid/nod', fetch: request }).latest(
+      '0.1.0',
+    ),
+    /HTTP 503/,
+  );
+});
+
+test('failed desktop updates expose safe details and allow an explicit retry without a background dialog', async (t) => {
+  const prompts = [];
+  let checks = 0;
+  const failure = new Error(
+    "The update download failed (HTTP 503) at https://private.example.invalid/update '/Users/Synthetic Owner/Updates/archive.zip' token=PRIVATE_UPDATE_TOKEN",
+    { cause: Object.assign(new Error('Connection reset'), { code: 'ECONNRESET' }) },
+  );
+  const updater = {
+    async check() {
+      checks++;
+      if (checks < 3) throw failure;
+    },
+  };
+  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
+    prompt: (options) => {
+      prompts.push(options);
+      return { response: 2 };
+    },
+  });
+  f.showEngine();
+  await new Promise(setImmediate);
+  const window = f.windows.at(-1);
+  const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+  const status = f.handlers.get('nod:updates:status');
+  await assert.rejects(f.checkUpdates(updater, false), /HTTP 503/);
+  const reported = status(event).failure;
+  assert.ok(reported);
+  assert.match(reported.message, /HTTP 503/);
+  assert.match(reported.message, /ECONNRESET/);
+  for (const privateValue of ['private.example.invalid', 'Synthetic Owner', 'PRIVATE_UPDATE_TOKEN'])
+    assert.equal(reported.message.includes(privateValue), false);
+  assert.equal(prompts.length, 0);
+  assert.equal(checks, 1);
+  assert.ok(
+    window.sent.some(([channel, value]) => channel === 'nod:updates:status' && value.failure),
+  );
+  f.handlers.get('nod:updates:dismiss')(event, reported.id);
+  assert.equal(status(event).failure.dismissed, true);
+  await assert.rejects(f.checkUpdates(updater, false), /HTTP 503/);
+  assert.equal(status(event).failure.id, reported.id);
+  assert.equal(status(event).failure.dismissed, true);
+  const retry = f.handlers.get('nod:updates:retry');
+  await assert.rejects(retry({ ...event, senderFrame: {} }, reported.id), /unavailable/);
+  await assert.rejects(retry(event, reported.id + 1), /changed/);
+  await retry(event, reported.id);
+  assert.equal(checks, 3);
+  assert.equal(status(event).failure, undefined);
+  await assert.rejects(retry(event, reported.id), /changed/);
+  assert.equal(checks, 3);
+});
+
+test('update failure details mask paths with spaces and keep structured reasons and statuses', async (t) => {
+  for (const failure of [
+    new Error('Could not access /Users/Synthetic Owner/Updates/archive.zip: EACCES'),
+    Object.assign(new Error('Could not access C:\\Users\\Synthetic Owner\\Updates\\archive.zip'), {
+      code: 'EACCES',
+    }),
+    Object.assign(new Error('The update request failed.'), {
+      status: 403,
+      cause: Object.assign(new Error('The signature is invalid.'), { code: 'EACCES' }),
+    }),
+    new Error(
+      'The update failed {"reason":"The signature is invalid.","status":403,"private":"PRIVATE_UPDATE_TOKEN"}',
+    ),
+    new Error('The request failed: access_token=PRIVATE_UPDATE_TOKEN'),
+    new Error('getaddrinfo ENOTFOUND private-host.example.invalid'),
+    new Error('getaddrinfo ENOTFOUND synthetic-device'),
+    new Error('connect ECONNREFUSED 192.0.2.41:443'),
+    new Error('connect ECONNREFUSED [2001:db8::41]:443'),
+    new Error('connect ECONNREFUSED ::ffff:192.0.2.41'),
+    new Error('connect ECONNREFUSED fe80::41%synthetic-device'),
+    new Error('connect ECONNREFUSED localhost:443'),
+    Object.assign(new Error('The update failed.'), { code: 'PRIVATE_UPDATE_TOKEN' }),
+    new Error(
+      'The update failed {"code":"PRIVATE_UPDATE_TOKEN","reason":"The signature is invalid."}',
+    ),
+  ]) {
+    const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'));
+    f.showEngine();
+    await new Promise(setImmediate);
+    const window = f.windows.at(-1);
+    const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+    await assert.rejects(
+      f.checkUpdates(
+        {
+          check: async () => {
+            throw failure;
+          },
+        },
+        false,
+      ),
+    );
+    const message = f.handlers.get('nod:updates:status')(event).failure.message;
+    for (const privateValue of [
+      'Synthetic',
+      'Owner',
+      'archive.zip',
+      'PRIVATE_UPDATE_TOKEN',
+      'private-host',
+      'example.invalid',
+      '192.0.2.41',
+      '2001:db8',
+      'fe80::41',
+      'synthetic-device',
+      'localhost',
+    ])
+      assert.equal(message.includes(privateValue), false);
+    if (failure.status || failure.message.includes('"status":403'))
+      assert.match(message, /HTTP 403/);
+    if (failure.cause || failure.message.includes('"reason"'))
+      assert.match(message, /signature is invalid/);
+    if (failure.code === 'EACCES') assert.match(message, /EACCES/);
+  }
+});
+
+test('update diagnostics keep the failed preparation or download step', async (t) => {
+  for (const phase of ['checking', 'preparing', 'downloading']) {
+    const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'));
+    await assert.rejects(
+      f.checkUpdates(
+        {
+          check: async () => {
+            f.reportUpdateStatus(phase);
+            throw new Error('The update request failed (HTTP 503).');
+          },
+        },
+        false,
+      ),
+    );
+    const log = await readFile(join(f.profileRoot, 'logs/startup.log'), 'utf8');
+    assert.ok(log.includes('update error phase=' + phase + ' '));
+  }
+});
+
+test('native update installation failures show the reason and retry or open the download page after shutdown', async (t) => {
+  for (const platform of ['win32', 'darwin'])
+    for (const choice of [0, 1, 2]) {
+      let installs = 0;
+      let exits = 0;
+      const prompts = [];
+      const install = () => {
+        installs++;
+        if (installs === 1)
+          throw Object.assign(
+            new Error('The update installer failed at /Users/Synthetic Owner/archive.zip'),
+            { code: 'EACCES' },
+          );
+      };
+      const f = await runningDesktop(
+        t,
+        async (url) =>
+          Response.json(
+            new URL(url).pathname === '/api/desktop/status' ? { running: [] } : { ok: true },
+          ),
+        {
+          platform,
+          allowStart: true,
+          startWindowsInstall: install,
+          quitAndInstall: install,
+          exit: () => {
+            exits++;
+          },
+          prompt: (options) => {
+            prompts.push(options);
+            return { response: choice };
+          },
+        },
+      );
+      f.crash();
+      await f.prepare();
+      f.showEngine();
+      await new Promise(setImmediate);
+      const candidate = { version: '0.5.2' };
+      await f.checkUpdates(
+        { ready: candidate, check: async () => candidate, dispose: async () => {} },
+        false,
+      );
+      await f.restartForUpdate();
+      assert.equal(installs, choice === 0 ? 2 : 1);
+      assert.equal(prompts.length, 1);
+      assert.match(prompts[0].message, /could not install/);
+      assert.match(prompts[0].detail, /EACCES/);
+      assert.equal(prompts[0].detail.includes('Synthetic Owner'), false);
+      assert.equal(f.children[0].killed, true);
+      assert.equal(exits, platform === 'win32' || choice !== 0 ? 1 : 0);
+      assert.deepEqual(
+        f.externalURLs,
+        choice === 1 ? ['https://nod.n8n.io/docs/get-started/install-desktop/'] : [],
+      );
+    }
+});
+
+test('a failed in-app restart keeps the verified update and retries it once with the current failure ID', async (t) => {
+  let checks = 0;
+  let restarts = 0;
+  const candidate = { version: '0.5.2' };
+  const updater = {
+    ready: candidate,
+    async check() {
+      checks++;
+      return candidate;
+    },
+    async restart() {
+      restarts++;
+      if (restarts === 1) throw new Error('The installer could not start (code 7).');
+    },
+  };
+  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
+    prompt: () => ({ response: 2 }),
+  });
+  f.showEngine();
+  await new Promise(setImmediate);
+  const window = f.windows.at(-1);
+  const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+  const status = f.handlers.get('nod:updates:status');
+  await f.checkUpdates(updater, false);
+  await f.handlers.get('nod:updates:restart')(event);
+  assert.equal(restarts, 1);
+  assert.equal(status(event).failure.phase, 'restart');
+  assert.equal(status(event).readyVersion, candidate.version);
+  const id = status(event).failure.id;
+  const bridge = await engineBridge(window, f.handlers);
+  const client = await onboardingClient(bridge.bridge);
+  await client.retryDesktopUpdate(id);
+  assert.equal(restarts, 2);
+  assert.equal(checks, 1);
+  assert.equal(status(event).failure, undefined);
+  await assert.rejects(client.retryDesktopUpdate(id), /changed/);
+  assert.equal(restarts, 2);
+});
+
+test('a failed browser open keeps an explicit retry and lets a stopped app quit', async (t) => {
+  for (const stopped of [false, true]) {
+    let opens = 0;
+    let exits = 0;
+    let openingPrompts = 0;
+    const f = await runningDesktop(t, async () => Response.json({ ok: true }), {
+      platform: 'win32',
+      startWindowsInstall: async () => {
+        throw new Error('The installer could not start.');
+      },
+      openExternal: async () => {
+        opens++;
+        throw Object.assign(new Error('The browser could not open.'), { code: 'EACCES' });
+      },
+      exit: () => {
+        exits++;
+      },
+      prompt: (options) => {
+        if (options.message === 'Nod could not open the download page.') {
+          openingPrompts++;
+          assert.match(options.detail, /EACCES/);
+          assert.match(
+            options.detail,
+            /https:\/\/nod\.n8n\.io\/docs\/get-started\/install-desktop\//,
+          );
+          assert.equal(options.buttons[1], stopped ? 'Quit Nod' : 'Not now');
+          return { response: openingPrompts === 1 ? 0 : 1 };
+        }
+        return { response: 1 };
+      },
+    });
+    if (stopped) {
+      f.crash();
+      const candidate = { version: '0.5.2' };
+      await f.checkUpdates(
+        { ready: candidate, check: async () => candidate, dispose: async () => {} },
+        false,
+      );
+      await f.quitApp();
+    } else {
+      f.showEngine();
+      await new Promise(setImmediate);
+      const window = f.windows.at(-1);
+      const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+      const download = f.handlers.get('nod:updates:download');
+      assert.throws(() => download({ ...event, senderFrame: {} }), /unavailable/);
+      await download(event);
+    }
+    assert.equal(opens, 2);
+    assert.equal(openingPrompts, 2);
+    assert.equal(exits, Number(stopped));
+  }
+});
+
+test('the update notice shows failure recovery and keeps newer status after a late initial read', async (t) => {
+  const bundled = await build({
+    stdin: {
+      contents: `import {createRoot} from 'react-dom/client';
+        import {flushSync} from 'react-dom';
+        import {createElement} from 'react';
+        import {DesktopUpdateToast} from './src/web/components/desktop-update-toast';
+        export {flushSync};
+        const root = createRoot(document.getElementById('root'));
+        export function mount() { flushSync(() => root.render(createElement(DesktopUpdateToast))); }
+        export function close() { flushSync(() => root.unmount()); }`,
+      resolveDir: fileURLToPath(new URL('../..', import.meta.url)),
+    },
+    bundle: true,
+    format: 'iife',
+    globalName: 'updateNotice',
+    write: false,
+    jsx: 'automatic',
+  });
+  const page = new JSDOM('<!doctype html><div id="root"></div>', {
+    url: 'https://app.example.invalid',
+    runScripts: 'outside-only',
+  });
+  t.after(() => page.window.close());
+  const initial = deferred();
+  const retried = deferred();
+  const retries = [];
+  const dismissals = [];
+  let downloads = 0;
+  let listener;
+  page.window.nodDesktop = {
+    updateStatus: () => initial.promise,
+    onUpdateStatus: (receive) => {
+      listener = receive;
+      return () => {
+        listener = undefined;
+      };
+    },
+    retryUpdate: async (id) => {
+      retries.push(id);
+      await retried.promise;
+    },
+    dismissUpdate: async (id) => {
+      dismissals.push(id);
+    },
+    downloadUpdate: async () => {
+      downloads++;
+    },
+  };
+  page.window.eval(bundled.outputFiles[0].text);
+  const view = page.window.updateNotice;
+  t.after(() => view.close());
+  view.mount();
+  const failed = {
+    phase: 'idle',
+    checking: false,
+    readyVersion: '0.5.1',
+    failure: { id: 1, phase: 'downloading', message: 'The download timed out.' },
+  };
+  view.flushSync(() => listener(failed));
+  initial.resolve({ phase: 'idle', checking: false });
+  await new Promise(setImmediate);
+  const document = page.window.document;
+  assert.match(document.body.textContent, /could not download/);
+  assert.match(document.querySelector('[role="alert"]').textContent, /timed out/);
+  assert.equal(
+    document.querySelector('a').href,
+    'https://nod.n8n.io/docs/get-started/install-desktop/',
+  );
+  view.flushSync(() => document.querySelector('a').click());
+  assert.equal(downloads, 1);
+  const button = (label) =>
+    [...document.querySelectorAll('button')].find((entry) => entry.textContent === label);
+  view.flushSync(() => button('Try again').click());
+  assert.deepEqual(retries, [1]);
+  assert.equal(button('Please wait…').disabled, true);
+  retried.reject(new Error('The update failure has changed. Check the update notice.'));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.match(document.body.textContent, /failure has changed/);
+  view.flushSync(() => listener({ ...failed, failure: { ...failed.failure, dismissed: true } }));
+  assert.match(document.body.textContent, /Nod 0.5.1 is ready/);
+  assert.equal(document.body.textContent.includes('failure has changed'), false);
+  view.flushSync(() => listener({ phase: 'ready', checking: false, readyVersion: '0.5.2' }));
+  assert.equal(document.body.textContent.includes('failure has changed'), false);
+  view.flushSync(() => listener({ ...failed, failure: { ...failed.failure, id: 2 } }));
+  view.flushSync(() => button('Dismiss').click());
+  assert.deepEqual(dismissals, [2]);
+  view.flushSync(() => listener({ ...failed, failure: { ...failed.failure, dismissed: true } }));
+  assert.match(document.body.textContent, /Nod 0.5.1 is ready/);
+  view.flushSync(() => listener({ phase: 'ready', checking: false, readyVersion: '0.5.2' }));
+  assert.match(document.body.textContent, /Nod 0.5.2 is ready/);
+  assert.equal(document.body.textContent.includes('failure has changed'), false);
+  assert.equal(button('Restart to update').disabled, false);
+  view.flushSync(() => button('Later').click());
+  assert.deepEqual(dismissals, [2, '0.5.2']);
 });
 
 test('ready desktop updates share Later across engine windows and reopen for a new version', async (t) => {

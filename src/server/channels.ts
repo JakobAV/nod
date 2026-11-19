@@ -27,7 +27,7 @@ import { appPagePath, appPages, appPageUrl } from '../shared/app-links.ts';
 import { pendingAnswerChoicesSql } from './answer-choices.ts';
 
 const replyCommand = /^\/(memory|context|usage)(?:@[A-Za-z0-9_]+)?$/i;
-const taskCommand = /^\/(tasks|status|stop)(?:@[A-Za-z0-9_]+)?$/i;
+const taskCommand = /^\/(tasks|status|stop|clear)(?:@[A-Za-z0-9_]+)?$/i;
 
 export type ChannelPresentation =
   | {
@@ -121,9 +121,10 @@ interface ChannelOptions {
   ) => Promise<{ text: string; attachments: Artifact[]; presentation?: ChannelPresentation }>;
   taskCommand?: (
     client: PoolClient,
-    command: 'tasks' | 'status' | 'stop',
+    command: 'tasks' | 'status' | 'stop' | 'clear',
     replyToMessageId?: string,
     hasReply?: boolean,
+    channel?: string,
   ) => Promise<{
     threadId: string;
     replies: Array<{ text: string; replyToMessageId?: string; presentation?: ChannelPresentation }>;
@@ -410,7 +411,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
   ) {
     const replyId = randomUUID();
     await client.query(
-      "INSERT INTO messages(id,owner_id,role,text,thread_id,attachments,reply_to_message_id) VALUES($1,$2,'assistant',$3,$4,$5,$6)",
+      "INSERT INTO messages(id,owner_id,role,text,thread_id,attachments,reply_to_message_id,created_at) VALUES($1,$2,'assistant',$3,$4,$5,$6,clock_timestamp())",
       [
         replyId,
         ownerId,
@@ -991,7 +992,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     const command =
       !pending.attachments?.length && options.taskCommand
         ? (taskCommand.exec(pending.text.trim())?.[1]?.toLowerCase() as
-            'tasks' | 'status' | 'stop' | undefined)
+            'tasks' | 'status' | 'stop' | 'clear' | undefined)
         : undefined;
     const retiredAnswer =
       permittedBeforeAnswer && retiredBeforeAnswer && hiddenBeforeAnswer && !command
@@ -1073,6 +1074,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           command,
           retiredBeforeAnswer ? undefined : replyToMessageId,
           retiredBeforeAnswer ? command === 'stop' : Boolean(row.provider_reply_id),
+          channel,
         );
         for (const message of reply.replies)
           await saveReply(client, row.source_id, reply.threadId, message);

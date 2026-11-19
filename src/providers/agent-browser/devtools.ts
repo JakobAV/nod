@@ -1,3 +1,4 @@
+import { BrowserActionError } from '../../ports/computer.ts';
 type FrameNode = {
   frame: { id: string; loaderId?: string; securityOrigin?: string };
   childFrames?: FrameNode[];
@@ -571,7 +572,7 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
           session,
         )) as { result?: { objectId?: string }; exceptionDetails?: unknown };
         if (exceptionDetails || (result?.objectId && found))
-          throw new Error('The sign-in selector must identify one control.');
+          throw new BrowserActionError('browser_sign_in_choice');
         if (result?.objectId) {
           const { node } = (await send(
             'DOM.describeNode',
@@ -605,20 +606,21 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
       }>;
     };
     const byId = new Map(nodes.map((node) => [node.nodeId, node]));
+    const target = nodes.find((item) => item.backendDOMNodeId === backendNodeId);
     const controls: Array<{ role: string; name: string }> = [];
     for (
-      let node = nodes.find((item) => item.backendDOMNodeId === backendNodeId);
+      let node = target;
       node && controls.length < 3;
       node = node.parentId ? byId.get(node.parentId) : undefined
     ) {
-      const name = String(node.name?.value ?? '').trim();
-      if (!node.ignored && name) controls.push({ role: String(node.role?.value ?? ''), name });
+      const name = node.ignored ? '' : String(node.name?.value ?? '').trim();
+      if (node === target || name) controls.push({ role: String(node.role?.value ?? ''), name });
     }
     return controls;
   };
 
   const controlTarget = async (query: ControlQuery) => {
-    const found = await locate(query);
+    const found = await locate(query, true);
     const [frame] = found ? await tree(found.session) : [];
     return found && frame?.loaderId
       ? {
@@ -646,7 +648,7 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
     return object.objectId;
   };
 
-  const controlSnapshot = async (objectId: string, session: string) => {
+  const snapshotOf = async (objectId: string, session: string) => {
     const { result, exceptionDetails } = (await send(
       'Runtime.callFunctionOn',
       {
@@ -656,9 +658,14 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
       },
       session,
     )) as { result?: { value?: string | null }; exceptionDetails?: unknown };
-    if (exceptionDetails || !result?.value)
-      throw new Error('The sign-in control is no longer available.');
-    return result.value;
+    if (exceptionDetails) throw new Error('The sign-in control is no longer available.');
+    return result?.value || null;
+  };
+
+  const controlSnapshot = async (objectId: string, session: string) => {
+    const value = await snapshotOf(objectId, session);
+    if (!value) throw new Error('The sign-in control is no longer available.');
+    return value;
   };
 
   return {
@@ -890,7 +897,7 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
     },
     async signInControl(query: ControlQuery): Promise<BoundSignInControl> {
       const found = query.selector ? await signInSelector(query.selector) : await locate(query);
-      if (!found) throw new Error('The sign-in control could not be found.');
+      if (!found) throw new BrowserActionError('browser_sign_in_choice');
       try {
         const frames = await tree(found.session);
         let frame: FrameNode['frame'] | undefined;
@@ -912,8 +919,7 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
             break;
           }
         }
-        if (!frame?.loaderId || !objectId)
-          throw new Error('The sign-in document is no longer available.');
+        if (!frame?.loaderId || !objectId) throw new BrowserActionError('browser_target_changed');
         const { result, exceptionDetails } = (await send(
           'Runtime.callFunctionOn',
           {
@@ -924,23 +930,22 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
           found.session,
         )) as { result?: { objectId?: string }; exceptionDetails?: unknown };
         if (exceptionDetails || !result?.objectId)
-          throw new Error('The sign-in control is not available.');
+          throw new BrowserActionError('browser_sign_in_choice');
         const { node } = (await send(
           'DOM.describeNode',
           { objectId: result.objectId },
           found.session,
         )) as { node: { backendNodeId: number } };
-        const snapshot = await controlSnapshot(result.objectId, found.session);
+        const snapshot = await snapshotOf(result.objectId, found.session);
+        if (!snapshot) throw new BrowserActionError('browser_sign_in_choice');
         const controls = await controlsFor({
           backendNodeId: node.backendNodeId,
           session: found.session,
         });
-        if (
-          !controls[0]?.name ||
-          !['button', 'link'].includes(controls[0].role) ||
-          (await controlSnapshot(result.objectId, found.session)) !== snapshot
-        )
-          throw new Error('The sign-in control changed during inspection.');
+        if (!controls[0]?.name || !['button', 'link'].includes(controls[0].role))
+          throw new BrowserActionError('browser_sign_in_choice');
+        if ((await snapshotOf(result.objectId, found.session)) !== snapshot)
+          throw new BrowserActionError('browser_target_changed');
         const details = JSON.parse(snapshot) as {
           origin: string;
           url: string;
@@ -1047,12 +1052,13 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
         await check();
         await send('Runtime.enable', {}, session);
         await send('Runtime.addBinding', { name, executionContextId: context }, session);
+        let resolveClick!: (received: boolean) => void;
         const clicked = new Promise<boolean>((resolve) => {
+          resolveClick = resolve;
           bindings.set(name, (payload) => {
             outcome = payload === 'accepted';
             resolve(outcome);
           });
-          timer = setTimeout(() => resolve(false), 5000);
         });
         await send(
           'Runtime.callFunctionOn',
@@ -1086,6 +1092,7 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
           page,
         );
         pressed = false;
+        timer = setTimeout(() => resolveClick(false), 5000);
         if (!(await clicked)) throw new Error('The sign-in control did not receive the click.');
       } finally {
         if (pressed)
@@ -1117,7 +1124,7 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
       }
     },
     async submits(query: ControlQuery, enter: boolean) {
-      const target = await locate(query);
+      const target = await locate(query, true);
       if (target) return formOf(target, enter);
       if (query.focused) return null;
       throw new Error('The control could not be found.');

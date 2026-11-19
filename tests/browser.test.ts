@@ -635,6 +635,81 @@ function result(response: BrowserResponse) {
   return response.ok ? response.result : undefined;
 }
 
+for (const kind of ['login', 'card'] as const)
+  test(`private ${kind} cancellation crosses the browser bridge without a later submission`, async () => {
+    const entered = deferred();
+    const release = deferred();
+    let operationSignal: AbortSignal | undefined;
+    let submissions = 0;
+    const wait = async (signal?: AbortSignal) => {
+      operationSignal = signal;
+      entered.resolve();
+      await release.promise;
+      signal?.throwIfAborted();
+      submissions++;
+    };
+    const fixture = await harness({
+      computer: fakeComputer({
+        injectCredentials: async (_input, signal) => {
+          await wait(signal);
+          return { status: 'submitted' };
+        },
+        fillCard: async (_input, signal) => {
+          await wait(signal);
+        },
+      }),
+    });
+    const computer = fixture.client(`/synthetic/private-${kind}`);
+    const controller = new AbortController();
+    const pending =
+      kind === 'login'
+        ? computer.injectCredentials(
+            {
+              threadId: 'task',
+              origin: 'https://example.com',
+              kind: 'password',
+              password: 'Synthetic bridge password',
+              passwordSelector: '#password',
+              submitSelector: '#submit',
+            },
+            controller.signal,
+          )
+        : computer.fillCard(
+            {
+              threadId: 'task',
+              fields: { number: '#number' },
+              document: 'synthetic-document',
+              destinations: { number: 'https://example.com' },
+              submitSelector: '#submit',
+              card: {
+                cardNumber: '4111111111111111',
+                expiryMonth: 12,
+                expiryYear: 2099,
+                cardholder: 'Synthetic owner',
+              },
+            },
+            controller.signal,
+          );
+    const rejected = assert.rejects(pending, /cancelled/);
+    try {
+      await entered.promise;
+      assert.ok(operationSignal);
+      assert.equal(operationSignal.aborted, false);
+      controller.abort();
+      for (let attempt = 0; !operationSignal.aborted && attempt < 100; attempt++) await delay(10);
+      assert.equal(operationSignal.aborted, true);
+      release.resolve();
+      await rejected;
+      assert.equal(submissions, 0);
+      await assert.rejects(computer.act('task', { action: 'snapshot' }), /unavailable/);
+      assert.ok(await computer.act('task', { action: 'open', url: 'https://example.com/reopen' }));
+    } finally {
+      release.resolve();
+      await rejected;
+      await fixture.close();
+    }
+  });
+
 test('quiesce refuses a pending request without aborting or querying its browser', async () => {
   const entered = deferred();
   const release = deferred();
@@ -945,6 +1020,8 @@ test('a card goes only into the approved fields on the approved sites and stays 
       }
       if (command[0] === 'get' && command[1] === 'url') data = { url };
       if (command[0] === 'get' && command[1] === 'cdp-url') data = { cdpUrl: devtools.url };
+      if (command[0] === 'is' && command[1] === 'enabled')
+        data = { enabled: Boolean(model.frameOf[command[2]!]) };
       if (command[0] === 'get' && command[1] === 'attr')
         data = {
           value: command[3] === 'autocomplete' ? (autocomplete[command[2]!] ?? null) : null,
@@ -2632,6 +2709,152 @@ test('a password typed through the handoff in several pauses hides only the fini
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test(
+  'native browser targets keep their own name before named ancestor context',
+  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'nod-target-name-native-'));
+    const server = createHttpServer((_request, response) => {
+      response.setHeader('content-type', 'text/html');
+      response.end(`<title>Synthetic target names</title>
+        <style>#blank{position:fixed;left:0;top:0;width:20vw;height:20vh}body{padding-top:25vh}</style>
+        <form aria-label="Named form"><button type="button" id="form-button"></button></form>
+        <section role="region" aria-label="Named region"><button id="blank"></button><input id="field"></section>
+        <button id="named">Named exact button<div id="child"></div></button>
+        <div id="custom" role="treeitem" aria-label="Named custom target" tabindex="0"></div>
+        <form action="/submit" method="post" aria-label="Known form"><input id="known"></form>`);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const origin = `http://127.0.0.1:${address.port}`;
+    const computer = createAgentBrowserComputer({
+      dataRoot: directory,
+      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+      privateNetwork: true,
+      headless: true,
+    });
+    try {
+      await computer.act('target-name', { action: 'open', url: origin });
+      for (const [selector, ancestor] of [
+        ['#form-button', 'Named form'],
+        ['#blank', 'Named region'],
+        ['#child', 'Named exact button'],
+      ]) {
+        const page = await computer.currentPage('target-name', { action: 'click', selector });
+        assert.equal(page.controls?.[0]?.name, '', selector);
+        assert.ok(
+          page.controls?.slice(1).some(({ name }) => name === ancestor),
+          selector,
+        );
+        assert.match(page.target!, /^[0-9a-f]{64}$/);
+      }
+      for (const step of [
+        { action: 'click', x: 0.05, y: 0.05 },
+        {
+          action: 'click',
+          points: [
+            { x: 0.05, y: 0.05 },
+            { x: 0.05, y: 0.05 },
+          ],
+        },
+      ] satisfies BrowserAction[]) {
+        const page = await computer.currentPage('target-name', step);
+        assert.equal(page.controls?.[0]?.name, '');
+        assert.equal(page.controls?.[1]?.name, 'Named region');
+      }
+      await computer.act('target-name', { action: 'fill', selector: '#field', text: 'synthetic' });
+      for (const step of [
+        { action: 'press', key: 'Enter' },
+        { action: 'type', text: 'synthetic\n' },
+      ] satisfies BrowserAction[]) {
+        const page = await computer.currentPage('target-name', step);
+        assert.deepEqual(page.controls?.[0], { role: 'textbox', name: '' });
+        assert.equal(page.controls?.[1]?.name, 'Named region');
+        assert.equal(page.submits, undefined);
+      }
+      for (const [selector, name] of [
+        ['#named', 'Named exact button'],
+        ['#custom', 'Named custom target'],
+      ]) {
+        const page = await computer.currentPage('target-name', { action: 'click', selector });
+        assert.equal(page.controls?.[0]?.name, name);
+      }
+      await computer.act('target-name', { action: 'fill', selector: '#known', text: 'synthetic' });
+      const known = await computer.currentPage('target-name', { action: 'press', key: 'Enter' });
+      assert.deepEqual(known.controls?.[0], { role: 'textbox', name: '' });
+      assert.equal(known.controls?.[1]?.name, 'Known form');
+      assert.deepEqual(known.submits, { method: 'POST', to: `${origin}/submit` });
+    } finally {
+      await computer.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'native coordinate targets follow normal pointer hit testing',
+  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'nod-pointer-target-native-'));
+    const requests: string[] = [];
+    const server = createHttpServer((request, response) => {
+      if (request.method === 'POST' || request.url?.startsWith('/overlay')) {
+        requests.push(`${request.method} ${request.url}`);
+        response.writeHead(204).end();
+        return;
+      }
+      const named = request.url === '/named';
+      response.setHeader('content-type', 'text/html');
+      response.end(`<title>Synthetic pointer target</title>
+        <style>button{position:fixed;inset:0;width:100vw;height:100vh;border:0}#overlay{pointer-events:none;opacity:.2}</style>
+        <form method="post" action="/actual-${named ? 'named' : 'blank'}"><button${named ? ' aria-label="Named actual target"' : ''}></button></form>
+        <form method="get" action="/overlay"><button id="overlay" aria-label="Named overlay">Named overlay</button></form>`);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const computer = createAgentBrowserComputer({
+      dataRoot: directory,
+      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+      privateNetwork: true,
+      headless: true,
+    });
+    try {
+      const expected: string[] = [];
+      for (const named of [false, true]) {
+        await computer.act('pointer-target', {
+          action: 'open',
+          url: `http://127.0.0.1:${address.port}/${named ? 'named' : 'blank'}`,
+        });
+        const step: BrowserAction = { action: 'click', x: 0.5, y: 0.5 };
+        const page = await computer.currentPage('pointer-target', step);
+        assert.ok(page.target);
+        assert.deepEqual(page.controls?.[0], {
+          role: 'button',
+          name: named ? 'Named actual target' : '',
+        });
+        assert.deepEqual(page.submits, {
+          method: 'POST',
+          to: `http://127.0.0.1:${address.port}/actual-${named ? 'named' : 'blank'}`,
+        });
+        assert.deepEqual(requests, expected);
+        await computer.act('pointer-target', { ...step, expectTarget: page.target });
+        expected.push(`POST /actual-${named ? 'named' : 'blank'}`);
+        for (let i = 0; i < 500 && requests.length < expected.length; i++) await delay(10);
+        assert.deepEqual(requests, expected);
+      }
+    } finally {
+      await computer.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   'native secure entry completes single and split OTP controls without maxlength hints',
@@ -6068,12 +6291,15 @@ test('failed private entry holds every Pi action until the filled document chang
   const directory = await mkdtemp(join(tmpdir(), 'nod-private-cleanup-'));
   const fixture = stagedLoginBrowser();
   let failSubmit = true;
+  let failedSubmissions = 0;
   const computer = createBrowserFixture({
     dataRoot: directory,
     run: async (...args) => {
       const command = args[1].slice(args[1].indexOf('--idle-timeout') + 2);
-      if (command[0] === 'click' && failSubmit)
+      if (command[0] === 'click' && failSubmit) {
+        failedSubmissions++;
         return { stdout: '{"success":false}', stderr: '', exitCode: 1 };
+      }
       return fixture.run(...args);
     },
   });
@@ -6089,6 +6315,7 @@ test('failed private entry holds every Pi action until the filled document chang
         submitSelector: 'button',
       }),
     );
+    assert.equal(failedSubmissions, 1);
     const before = fixture.pages.get('private')!.entered.length;
     for (const input of [
       { action: 'snapshot' as const },
@@ -6363,10 +6590,33 @@ test(
         to: `${origin}/reserve`,
       });
       await computer.act('submits', { action: 'fill', selector: 'input[name=q]', text: 'tables' });
-      assert.deepEqual(await submits({ action: 'press', key: 'Enter' }), {
-        method: 'GET',
-        to: `${origin}/search`,
-      });
+      for (const key of [
+        'Enter',
+        'Return',
+        'Shift+Enter',
+        'Enter+Shift',
+        'Ctrl+Enter+Meta',
+        'NumpadEnter',
+        '\r',
+        '\n',
+      ]) {
+        assert.deepEqual(
+          await submits({ action: 'press', key }),
+          {
+            method: 'GET',
+            to: `${origin}/search`,
+          },
+          key,
+        );
+      }
+      for (const key of [
+        'Enter+Unknown',
+        ' Enter ',
+        'ControlOrMeta+Enter',
+        'Enter\n',
+        'ShiftLeft+Enter',
+      ])
+        assert.equal(await submits({ action: 'press', key }), undefined, key);
       await computer.act('submits', {
         action: 'evaluate',
         script: "document.querySelector('form button').focus()",
@@ -6565,6 +6815,29 @@ test('chat retires reply targets without losing drafts or duplicating ambiguous 
         assert.equal(requests[3].text, draft);
         assert.ok(document.querySelector('[data-message-id="' + committed.clientMessageId + '"]'));
         assert.equal(document.querySelector('[role="alert"]'), null);
+        await act(async () => root.unmount());
+        committed = null;
+        saveDraft(null);
+        state = { ...state, hiddenMessageIds: [], messages };
+        root = createRoot(document.getElementById('root'));
+        await render();
+        await settle(hasDraft);
+        await reply(ids[0]);
+        await submit();
+        await settle(() => requests.length === 5);
+        await act(async () => releases.at(-1).reject(new TypeError('Synthetic ordinary reply response lost')));
+        await settle(() => hasDraft() && document.querySelector('.composer-reply'));
+        state = { ...state, messages: [], chatClearedAt: '2026-10-26T12:02:00.000000Z' };
+        await render();
+        await settle(() => hasDraft() && !document.querySelector('.composer-reply'));
+        await submit();
+        await settle(() => requests.length === 6);
+        assert.equal(requests[5].replyToMessageId, undefined);
+        assert.notEqual(requests[5].clientMessageId, requests[4].clientMessageId);
+        assert.equal(requests[5].chatClearedAt, state.chatClearedAt);
+        await act(async () => releases.at(-1).resolve(Response.json({
+          messageId: requests[5].clientMessageId, turnId: 'synthetic-fresh-chat-turn',
+        })));
       } finally {
         await act(async () => root.unmount());
         dom.window.close();
@@ -7155,11 +7428,11 @@ test('chat shows pending sends and active work before a model step', async () =>
         assert.ok(!document.querySelector('.thinking').textContent.includes('**'));
         assert.ok(!document.querySelector('.thinking').textContent.includes('hotel'));
         const history = document.querySelector('.thinking details');
-        assert.equal(history.open, true);
+        assert.equal(history.open, false);
         assert.deepEqual(Array.from(history.querySelectorAll('ol > li'), entry => entry.textContent), ['Read the synthetic report']);
         assert.equal(document.querySelector('[role="status"] [role="status"]'), null);
         await act(async () => history.querySelector('summary').click());
-        await settle(() => !history.open);
+        await settle(() => history.open);
         await render({ streams: { 'synthetic-stream': 'Synthetic partial result' } });
         assert.equal(document.querySelector('.thinking').hidden, true);
         assert.equal(document.querySelector('.thinking details'), history);
@@ -7167,11 +7440,11 @@ test('chat shows pending sends and active work before a model step', async () =>
         await render();
         assert.equal(document.querySelector('.thinking').hidden, false);
         assert.equal(document.querySelector('.thinking details'), history);
-        assert.equal(history.open, false);
+        assert.equal(history.open, true);
         assert.equal(document.querySelector('.thinking .live-line-current').textContent, 'Checking the return journey');
         state = { ...state, activity: [{ ...activity, turnId: 'synthetic-next-turn', recent }] };
         await render();
-        assert.equal(document.querySelector('.thinking details').open, true);
+        assert.equal(document.querySelector('.thinking details').open, false);
         state = { ...state, activity: [] };
         await render();
         assert.equal(Boolean(document.querySelector('.thinking')), false);
