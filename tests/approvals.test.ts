@@ -44,16 +44,22 @@ import { createErrorRedactor } from '../src/server/redaction.ts';
 import {
   approvalContent,
   approvalTitle,
+  calendarEventTarget,
   gmailDraftTarget,
   gmailMessageTarget,
 } from '../src/server/action-presentation.ts';
 import { createCommunication } from '../src/server/communication.ts';
+import { channelReply } from '../src/server/channels.ts';
 import { ApprovalCard, ApprovalChoiceCard } from '../src/web/components/action-card.tsx';
 import { MessageText } from '../src/web/components/message.tsx';
 import { createE2eCurators } from '../scripts/e2e-curators.ts';
 import { createIntegrationFixture } from '../scripts/e2e-fixtures.ts';
 import { createPiMemoryCurator } from '../src/providers/pi/memory-curator.ts';
+import { createDecisionModel } from '../src/providers/decisions.ts';
+import { appTools, appToolArgs } from '../src/server/app-reads.ts';
+import { captureOwnerInstructions } from '../src/server/owner-instructions.ts';
 import { createIntegrations } from '../src/server/integrations.ts';
+import { createChatSdkTransport } from '../src/providers/chat-sdk/index.ts';
 
 function markdownNodes(markdown: string) {
   const tree = unified().use(remarkParse).use(remarkGfm).parse(markdown);
@@ -176,11 +182,12 @@ test('confirmation repairs rejected wording against the unchanged saved action',
     const communication = createCommunication({
       pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
       ownerId: 'synthetic-owner',
-      review: async (_instructions, input) => {
+      review: async (_instructions, input, _signal, _question, responseSchema) => {
         const request = input as Record<string, any>;
         assert.deepEqual(request.data.args, proposal.args);
         assert.equal(request.data.action, proposal.action);
         if (request.purpose === 'confirmation_review') {
+          assert.equal(responseSchema, undefined);
           checks++;
           assert.equal(request.repair, undefined);
           if (mode === 'invalid_review' && checks === 1) return { valid: 'true' };
@@ -193,6 +200,10 @@ test('confirmation repairs rejected wording against the unchanged saved action',
                 reason: 'The question or label describes sending instead of searching.',
               };
         }
+        assert.equal(responseSchema?.type, 'object');
+        assert.equal(responseSchema?.$schema, undefined);
+        assert.deepEqual(responseSchema?.required, ['text', 'action']);
+        assert.equal(responseSchema?.additionalProperties, false);
         drafts++;
         request.data.args.query = 'A mutated draft must not change the saved action';
         if (drafts === 1) {
@@ -213,6 +224,153 @@ test('confirmation repairs rejected wording against the unchanged saved action',
     assert.equal(checks, mode === 'format' ? 1 : 2);
     assert.deepEqual(proposal.args, { query: 'Synthetic receipts' });
   }
+});
+
+test('invalid confirmation replies keep a bounded reason and the failed attempt state', async (t) => {
+  for (const kind of [
+    'action',
+    'text',
+    'fields',
+    'review then action',
+    'long action',
+    'multiline action',
+    'long text',
+    'empty text',
+  ] as const)
+    await t.test(kind, async () => {
+      let drafts = 0;
+      let reviews = 0;
+      const repairs: Array<{ issue?: unknown }> = [];
+      const communication = createCommunication({
+        pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+        ownerId: 'synthetic-owner',
+        review: async (_instructions, input) => {
+          const request = input as Record<string, any>;
+          if (request.purpose === 'confirmation_review') {
+            reviews++;
+            return { valid: false, reason: 'The synthetic target is incorrect.' };
+          }
+          drafts++;
+          if (request.repair) repairs.push(structuredClone(request.repair));
+          if (kind === 'text') return { action: 'Send email' };
+          if (kind === 'long action')
+            return { text: 'Send the synthetic email?', action: 'A'.repeat(65) };
+          if (kind === 'multiline action')
+            return { text: 'Send the synthetic email?', action: 'Send\nemail' };
+          if (kind === 'long text') return { text: 'A'.repeat(12_001), action: 'Send email' };
+          if (kind === 'empty text') return { text: ' ', action: 'Send email' };
+          if (kind === 'fields')
+            return {
+              text: 'Send the synthetic email?',
+              action: 'Send email',
+              PRIVATE_REPLY_KEY: 'PRIVATE_REPLY_VALUE',
+            };
+          if (kind === 'review then action' && drafts === 1)
+            return { text: 'Send the synthetic email?', action: 'Send email' };
+          return { text: 'Send the synthetic email?' };
+        },
+      });
+      await assert.rejects(
+        communication.describe({
+          turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+          action: 'GMAIL_SEND_EMAIL',
+          args: { recipient_email: 'format@example.test', body: 'Synthetic message.' },
+        }),
+        (error: Error & { notRun?: boolean }) => {
+          assert.equal(drafts, 2);
+          assert.equal(reviews, kind === 'review then action' ? 1 : 0);
+          assert.doesNotMatch(error.message, /PRIVATE_REPLY_KEY|PRIVATE_REPLY_VALUE/);
+          assert.doesNotMatch(JSON.stringify(repairs), /PRIVATE_REPLY_KEY|PRIVATE_REPLY_VALUE/);
+          assert.ok(repairs.length > 0);
+          assert.ok(
+            repairs.every((repair) => typeof repair.issue === 'string' && repair.issue.trim()),
+          );
+          assert.equal(error.notRun, true);
+          return true;
+        },
+      );
+    });
+});
+
+test('an ordinary message format failure makes no claim about an action', async () => {
+  let drafts = 0;
+  const communication = createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    review: async () => {
+      drafts++;
+      return { action: 'Synthetic invalid message' };
+    },
+  });
+  await assert.rejects(
+    communication.present(null, { kind: 'question', question: 'Which synthetic item?' }),
+    (error: Error & { notRun?: boolean }) => {
+      assert.equal(drafts, 2);
+      assert.equal(error.notRun, undefined);
+      return true;
+    },
+  );
+});
+
+test('a complete email approval refuses a hidden sender identity', async () => {
+  let calls = 0;
+  const communication = createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    review: async (_instructions, input) => {
+      calls++;
+      return Object(input).purpose === 'confirmation_review'
+        ? { valid: true }
+        : { text: 'Send this synthetic email?', action: 'Send email' };
+    },
+  });
+  const proposal = {
+    turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+    channel: 'web',
+    action: 'GMAIL_SEND_EMAIL',
+    args: {
+      recipient_email: 'recipient@example.test',
+      subject: 'Synthetic sender check',
+      body: 'Synthetic message.',
+    },
+    details: {
+      completeMessageReview: true,
+      account: { name: 'Gmail', identity: 'sender@example.test' },
+    },
+  };
+  const visible = await communication.describe(proposal);
+  assert.ok(visible.question.includes('sender@example.test'));
+  assert.equal(calls, 2);
+  calls = 0;
+  proposal.details.account.identity = `ghp_${'synthetic'.repeat(4)}@example.test`;
+  await assert.rejects(communication.describe(proposal), /hidden values|sender/);
+  assert.equal(calls, 0);
+});
+
+test('a complete email approval refuses an empty recipient', async () => {
+  const communication = createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    review: async (_instructions, input) =>
+      Object(input).purpose === 'confirmation_review'
+        ? { valid: true }
+        : { text: 'Send this synthetic email?', action: 'Send email' },
+  });
+  for (const key of ['recipient_email', 'to'])
+    for (const value of ['', '   ', [], ['', ' ']])
+      await assert.rejects(
+        communication.describe({
+          turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+          channel: 'web',
+          action: 'GMAIL_SEND_EMAIL',
+          args: { [key]: value, subject: 'Synthetic recipient check', body: 'Synthetic message.' },
+          details: {
+            completeMessageReview: true,
+            account: { name: 'Gmail', identity: 'sender@example.test' },
+          },
+        }),
+        /cannot identify the message recipient/,
+      );
 });
 
 test('local file confirmation reviews the visible path and rejects a different path', async (t) => {
@@ -536,6 +694,343 @@ test('browser confirmation uses the page as context without displaying its actio
   );
 });
 
+test('a schedule confirmation shows the checked instruction before reviewing its question', async () => {
+  const prompt =
+    'Review inbox@example.test threads and attachments. Include linked summaries. Never send email or change sources.';
+  const definition = {
+    title: 'Synthetic inbox review',
+    prompt,
+    kind: 'recurring',
+    cron: '0 15 * * *',
+    runAt: null,
+    timeZone: 'Europe/London',
+    enabled: true,
+    watch: null,
+  };
+  const original = structuredClone(definition);
+  let drafts = 0;
+  const reviews: Array<Record<string, any>> = [];
+  const communication = createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    review: async (_instructions, value) => {
+      const input = value as Record<string, any>;
+      assert.deepEqual(input.data.details.scheduleDefinition, original);
+      if (input.purpose === 'confirmation_review') {
+        reviews.push(input);
+        if (input.text.includes('wrong@example.test'))
+          return { valid: false, reason: 'The question names a different Gmail account.' };
+        return input.text.includes(prompt) &&
+          input.text.includes('Every day at 15:00') &&
+          input.text.includes('Europe/London')
+          ? { valid: true }
+          : { valid: false, reason: 'The complete instruction and timing are not visible.' };
+      }
+      drafts++;
+      if (drafts === 1)
+        return {
+          text: 'Create a daily Gmail review for wrong@example.test?',
+          action: 'Create schedule',
+        };
+      assert.ok(input.repair);
+      assert.ok(!input.repair.draft.text.includes(prompt));
+      return { text: 'Create this schedule?', action: 'Create schedule' };
+    },
+  });
+  const result = await communication.describe({
+    turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+    channel: 'web',
+    action: 'NOD_schedule_create',
+    args: { title: definition.title, prompt, cron: definition.cron, timeZone: definition.timeZone },
+    details: { scheduleDefinition: definition },
+  });
+  assert.equal(drafts, 2);
+  assert.equal(reviews.length, 2);
+  assert.ok(reviews[1]!.text.includes(prompt));
+  assert.match(result.question, /Synthetic inbox review/);
+  assert.match(result.question, /Every day at 15:00/);
+  assert.match(result.question, /Europe\/London/);
+  assert.match(result.question, /Never send email or change sources/);
+  assert.ok(!result.question.includes('wrong@example.test'));
+  assert.equal(result.action, 'Create schedule');
+  assert.deepEqual(definition, original);
+});
+
+test('schedule confirmations keep literal instructions, checked timing and enabled state', async (t) => {
+  const prompt = [
+    'Review inbox@example.test.',
+    '',
+    'Keep [the source](https://records.example.test/item) and `literal values`.',
+    '    Keep this indentation.',
+    '```',
+    '{"synthetic":"Never send email"}',
+    '```',
+    'Synthetic text. '.repeat(350),
+    'Final limit: do not change any source.',
+  ].join('\n');
+  for (const timing of [
+    { kind: 'recurring', cron: '5 15 * * 1-5', expected: 'Every weekday at 15:05' },
+    { kind: 'recurring', cron: '7 11 2,9 * *', expected: 'Custom timing: 7 11 2,9 * *' },
+    ...[29, 30, 31].map((day) => ({
+      kind: 'recurring',
+      cron: `0 15 ${day} * *`,
+      expected: `Day ${day} of each month that has that day at 15:00`,
+    })),
+    {
+      kind: 'once',
+      runAt: '2030-11-24T15:00:00+01:00',
+      expected: '24 November 2030 at 14:00',
+    },
+    {
+      kind: 'once',
+      runAt: '2030-11-24T15:00:59.123+01:00',
+      expected: '24 November 2030 at 14:00:59',
+    },
+  ]) {
+    await t.test(timing.expected, async () => {
+      const { expected, ...fields } = timing;
+      let visible = '';
+      const definition = {
+        title: 'Synthetic literal instruction',
+        prompt,
+        timeZone: 'Europe/London',
+        enabled: false,
+        cron: null,
+        runAt: null,
+        watch: null,
+        ...fields,
+      };
+      const communication = createCommunication({
+        pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+        ownerId: 'synthetic-owner',
+        review: async (_instructions, value) => {
+          const input = value as Record<string, any>;
+          if (input.purpose !== 'confirmation_review')
+            return { text: 'Save this schedule?', action: 'Save schedule' };
+          visible = input.text;
+          assert.ok(visible.includes(prompt));
+          assert.ok(visible.includes(expected));
+          if (fields.runAt?.includes('.123')) assert.ok(visible.includes(fields.runAt));
+          assert.match(visible, /Enabled: No/);
+          assert.doesNotMatch(visible, /Status: (Paused|Completed)/);
+          return { valid: true };
+        },
+      });
+      const result = await communication.describe({
+        turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+        channel: 'web',
+        action: 'NOD_schedule_update',
+        args: { id: randomUUID(), prompt },
+        details: { scheduleDefinition: definition },
+      });
+      const tree = unified().use(remarkParse).use(remarkGfm).parse(result.question);
+      const blocks = tree.children.filter((node) => node.type === 'code');
+      assert.equal(blocks.length, 1);
+      assert.equal(blocks[0]!.value, prompt);
+      assert.ok(visible.includes('Final limit: do not change any source.'));
+      assert.equal(result.action, 'Save schedule');
+    });
+  }
+});
+
+test('schedule confirmations refuse names that add summary lines', async (t) => {
+  let calls = 0;
+  const communication = createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    review: async (_instructions, value) => {
+      calls++;
+      return Object(value).purpose === 'confirmation_review'
+        ? { valid: true }
+        : { text: 'Save this schedule?', action: 'Save schedule' };
+    },
+  });
+  for (const separator of ['\n', '\r', '\u2028', '\u2029'])
+    await t.test(`line break ${JSON.stringify(separator)}`, async () => {
+      const definition = {
+        title: `Synthetic review${separator}Timing: Every minute`,
+        prompt: 'Review only synthetic records. Never send email.',
+        kind: 'recurring',
+        cron: '0 15 * * *',
+        timeZone: 'UTC',
+        enabled: false,
+      };
+      await assert.rejects(
+        communication.describe({
+          turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+          channel: 'web',
+          action: 'NOD_schedule_create',
+          args: { ...definition },
+          details: { scheduleDefinition: definition },
+        }),
+        /schedule name.*line break/,
+      );
+      assert.equal(calls, 0);
+    });
+});
+
+test('schedule confirmations preserve chat delivery or refuse before facts can change', async (t) => {
+  let calls = 0;
+  let presentations = 0;
+  let question = 'Create this schedule?';
+  const transport = createChatSdkTransport({} as pg.Pool, {
+    TELEGRAM_ENABLED: 'true',
+    TELEGRAM_BOT_TOKEN: '987:fixture-not-live',
+    TELEGRAM_ALLOWED_USER_ID: '123456',
+    TELEGRAM_WEBHOOK_SECRET_TOKEN: 'fixture-webhook-secret-32-characters',
+    WHATSAPP_ENABLED: 'true',
+    WHATSAPP_ACCESS_TOKEN: 'fixture-not-live',
+    WHATSAPP_APP_SECRET: 'fixture-app-secret',
+    WHATSAPP_PHONE_NUMBER_ID: '555000',
+    WHATSAPP_VERIFY_TOKEN: 'fixture-verify-token',
+    WHATSAPP_ALLOWED_NUMBER: '351910000000',
+    WHATSAPP_POLICY_CONFIRMED: 'true',
+  });
+  const communication = createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    canDeliverLiteral: (channelId, text, literal) =>
+      transport.canDeliverLiteral!({ channelId, text, literal }),
+    review: async (_instructions, value) => {
+      calls++;
+      return Object(value).purpose === 'confirmation_review'
+        ? { valid: true }
+        : { text: question, action: 'Create schedule' };
+    },
+  });
+  const proposal = {
+    turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+    action: 'NOD_schedule_create',
+    args: {},
+    details: {
+      scheduleDefinition: {
+        title: 'Synthetic local review',
+        prompt: 'Read https://records.example.test/item. Never send email.',
+        kind: 'recurring',
+        cron: '0 15 * * *',
+        timeZone: 'UTC',
+        enabled: true,
+      },
+    },
+  };
+  for (const channel of ['telegram', 'whatsapp']) {
+    const result = await communication.describe({ ...proposal, channel });
+    const delivered = await channelReply(result.question, {
+      threadId: proposal.turn.threadId,
+      present: async () => {
+        presentations++;
+        return 'This must not replace the checked facts.';
+      },
+    });
+    assert.equal(delivered, result.question);
+  }
+  assert.equal(presentations, 0);
+  for (const [channel, title] of [
+    ['telegram', '{{emoji:smile}}'],
+    ['whatsapp', '```'],
+  ] as const) {
+    await t.test(`${channel} refuses a title that changes its visible facts`, async () => {
+      proposal.details.scheduleDefinition.title = title;
+      const before = calls;
+      await assert.rejects(
+        communication.describe({ ...proposal, channel }),
+        /cannot show the complete schedule confirmation in this channel/,
+      );
+      assert.equal(calls, before);
+    });
+  }
+  proposal.details.scheduleDefinition.title = 'Synthetic local review';
+  for (const [channel, text] of [
+    ['telegram', 'Create {{emoji:smile}} this schedule?'],
+    ['whatsapp', 'Create ``` this schedule?'],
+  ] as const) {
+    await t.test(`${channel} also checks the reviewed model question`, async () => {
+      question = text;
+      const before = calls;
+      await assert.rejects(
+        communication.describe({ ...proposal, channel }),
+        /cannot show the complete schedule confirmation in this channel/,
+      );
+      assert.equal(calls, before + 2);
+    });
+  }
+  question = 'Create this schedule?';
+  for (const prompt of [
+    `${'Synthetic text. '.repeat(350)}\n[Review](https://records.example.test/item)\n    Never send email.`,
+    'Keep {{emoji:smile}} as literal text. Never send email.',
+  ]) {
+    proposal.details.scheduleDefinition.prompt = prompt;
+    const before = calls;
+    for (const channel of ['telegram', 'whatsapp'])
+      await assert.rejects(
+        communication.describe({ ...proposal, channel }),
+        /cannot show the complete schedule confirmation in this channel/,
+      );
+    assert.equal(calls, before);
+  }
+  proposal.details.scheduleDefinition.prompt = 'Keep ``` as literal text. Never send email.';
+  await communication.describe({ ...proposal, channel: 'telegram' });
+  await assert.rejects(
+    communication.describe({ ...proposal, channel: 'whatsapp' }),
+    /cannot show the complete schedule confirmation in this channel/,
+  );
+  proposal.details.scheduleDefinition.prompt = 'Read http://localhost:5678. Never send email.';
+  const web = await communication.describe({ ...proposal, channel: 'web' });
+  assert.ok(web.question.includes(proposal.details.scheduleDefinition.prompt));
+  const before = calls;
+  for (const channel of ['telegram', 'whatsapp'])
+    await assert.rejects(
+      communication.describe({ ...proposal, channel }),
+      /cannot show the complete schedule confirmation in this channel/,
+    );
+  await assert.rejects(communication.describe(proposal), /no verified delivery channel/);
+  await assert.rejects(
+    communication.describe({ ...proposal, channel: 'unknown' }),
+    /cannot show the complete schedule confirmation in this channel/,
+  );
+  assert.equal(calls, before);
+});
+
+test('schedule confirmation facts do not replace the independent review', async () => {
+  let calls = 0;
+  const watch = [randomUUID()];
+  const communication = createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    review: async (_instructions, value) => {
+      calls++;
+      const input = value as Record<string, any>;
+      assert.deepEqual(input.data.details.scheduleDefinition.watch, watch);
+      assert.equal(input.data.details.targetModel.name, 'Synthetic model');
+      return input.purpose === 'confirmation_review'
+        ? { valid: false, reason: 'The question omits the watched-source and model conditions.' }
+        : { text: 'Create this schedule?', action: 'Create schedule' };
+    },
+  });
+  await assert.rejects(
+    communication.describe({
+      turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+      channel: 'web',
+      action: 'NOD_schedule_create',
+      args: {},
+      details: {
+        targetModel: { name: 'Synthetic model' },
+        scheduleDefinition: {
+          title: 'Synthetic watched review',
+          prompt: 'Review inbox@example.test. Never send email.',
+          kind: 'recurring',
+          cron: '0 15 * * *',
+          timeZone: 'UTC',
+          enabled: true,
+          watch,
+        },
+      },
+    }),
+    /omits the watched-source and model conditions/,
+  );
+  assert.equal(calls, 4);
+});
+
 test('a complete schedule approval refuses a definition with hidden values', async () => {
   let calls = 0;
   const communication = createCommunication({
@@ -577,9 +1072,19 @@ test('a complete schedule approval keeps ordinary text and still hides Basic cre
   });
   const proposal = {
     turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+    channel: 'web',
     action: 'NOD_schedule_create',
     args: { prompt },
-    details: { scheduleDefinition: { prompt } },
+    details: {
+      scheduleDefinition: {
+        title: 'Synthetic basic briefing',
+        prompt,
+        kind: 'recurring',
+        cron: '0 9 * * *',
+        timeZone: 'UTC',
+        enabled: true,
+      },
+    },
   };
   await communication.describe(proposal);
   assert.equal(calls, 2);
@@ -986,6 +1491,123 @@ test('payment presentation repairs a missing action label', async () => {
     action: 'Approve payment',
   });
   assert.equal(calls, 2);
+});
+
+test('Calendar approval binds the private event version before projecting its target', () => {
+  const event = {
+    id: 'synthetic-event',
+    etag: '"synthetic-private-version-1"',
+    summary: 'Synthetic plan',
+    start: { dateTime: '2030-11-24T09:00:00Z' },
+    end: { dateTime: '2030-11-24T10:00:00Z' },
+    attendeesOmitted: true,
+  };
+  const before = calendarEventTarget(event, event.id);
+  const after = calendarEventTarget({ ...event, etag: '"synthetic-private-version-2"' }, event.id);
+  assert.ok(before && after);
+  assert.deepEqual(before.target, after.target);
+  assert.notEqual(before.revision, after.revision);
+  assert.equal(JSON.stringify(before).includes('synthetic-private-version'), false);
+  for (const etag of [undefined, null, 17, '', ' ', 'x'.repeat(1025)])
+    assert.equal(calendarEventTarget({ ...event, etag }, event.id), undefined);
+});
+
+test('Calendar approval does not claim an unspecified end and marks known ends exclusive', () => {
+  const event = {
+    id: 'synthetic-event',
+    etag: '"synthetic-calendar-version"',
+    start: { date: '2030-11-24' },
+    end: { date: '2030-11-25' },
+  };
+  assert.equal(calendarEventTarget({ ...event, endTimeUnspecified: true }, event.id), undefined);
+  const known = calendarEventTarget({ ...event, endTimeUnspecified: false }, event.id);
+  assert.ok(known);
+  assert.equal(known.target.startsAt, '2030-11-24');
+  assert.equal(known.target.endsAt, '2030-11-25');
+  assert.equal(known.target.endExclusive, true);
+});
+
+test('Calendar local times use the event zones instead of the host zone', () => {
+  const event = {
+    id: 'synthetic-event',
+    etag: '"synthetic-calendar-version-1"',
+    summary: 'Synthetic travel plan',
+    start: { dateTime: '2030-11-24T10:00:00', timeZone: 'Europe/Paris' },
+    end: { dateTime: '2030-11-24T05:00:00', timeZone: 'America/New_York' },
+    recurringEventId: 'synthetic-series',
+    originalStartTime: { dateTime: '2030-11-24T11:00:00', timeZone: 'Europe/Helsinki' },
+  };
+  const target = calendarEventTarget({ data: event }, event.id)?.target;
+  assert.ok(target);
+  assert.equal(Date.parse(target.startsAt), Date.parse('2030-11-24T09:00:00Z'));
+  assert.equal(Date.parse(target.endsAt), Date.parse('2030-11-24T10:00:00Z'));
+  assert.equal(Date.parse(target.originalStartsAt!), Date.parse('2030-11-24T09:00:00Z'));
+  assert.equal(target.timeZone, 'Europe/Paris');
+  assert.equal(target.endTimeZone, 'America/New_York');
+  assert.equal(target.originalTimeZone, 'Europe/Helsinki');
+  assert.equal(target.scope, 'occurrence');
+  assert.equal(
+    calendarEventTarget(
+      { data: { ...event, end: { ...event.end, dateTime: '2030-11-24T03:00:00' } } },
+      event.id,
+    ),
+    undefined,
+  );
+});
+
+test('Calendar local times refuse missing zones, clock gaps and repeated clock times', () => {
+  for (const start of [
+    { dateTime: '2030-11-24T10:00:00' },
+    { dateTime: '2030-03-31T02:30:00', timeZone: 'Europe/Paris' },
+    { dateTime: '2030-10-27T02:30:00', timeZone: 'Europe/Paris' },
+  ]) {
+    assert.equal(
+      calendarEventTarget(
+        {
+          id: 'synthetic-event',
+          etag: '"synthetic-calendar-version-1"',
+          start,
+          end: { dateTime: '2030-11-25T10:00:00Z' },
+        },
+        'synthetic-event',
+      ),
+      undefined,
+    );
+  }
+  const target = calendarEventTarget(
+    {
+      id: 'synthetic-event',
+      etag: '"synthetic-calendar-version-1"',
+      start: { dateTime: '2030-10-27T02:30:00+02:00', timeZone: 'Europe/Paris' },
+      end: { dateTime: '2030-10-27T02:30:00+01:00', timeZone: 'Europe/Paris' },
+    },
+    'synthetic-event',
+  )?.target;
+  assert.ok(target);
+  assert.equal(Date.parse(target.endsAt) - Date.parse(target.startsAt), 3_600_000);
+});
+
+test('Calendar approval keeps the end and occurrence zones when offsets are present', () => {
+  const event = {
+    id: 'synthetic-event',
+    etag: '"synthetic-calendar-version-1"',
+    start: { dateTime: '2030-11-24T10:00:00+01:00', timeZone: 'Europe/Paris' },
+    end: { dateTime: '2030-11-24T05:00:00-05:00', timeZone: 'America/New_York' },
+    recurringEventId: 'synthetic-series',
+    originalStartTime: { dateTime: '2030-11-24T11:00:00+02:00', timeZone: 'Europe/Helsinki' },
+  };
+  const target = calendarEventTarget(event, event.id)?.target;
+  assert.ok(target);
+  assert.equal(target.endTimeZone, 'America/New_York');
+  assert.equal(target.originalTimeZone, 'Europe/Helsinki');
+  for (const part of ['end', 'originalStartTime'] as const)
+    assert.equal(
+      calendarEventTarget(
+        { ...event, [part]: { ...event[part], timeZone: 'Invalid/Synthetic' } },
+        event.id,
+      ),
+      undefined,
+    );
 });
 
 test('Gmail delete target metadata must match the bound message ID', () => {
@@ -1776,6 +2398,8 @@ test(
       const tasks = createTasks({ pool: db.pool, ownerId });
       await tasks.initialize();
       tasks.registerRoutes(app);
+      const { createTriage } = await import('../src/server/triage.ts');
+      createTriage({ signal: async () => {}, due: async () => {} }).registerRoutes(app);
       app.get('/api/fixture-error', async () => {
         throw new Error('fixture-private-key');
       });
@@ -1814,6 +2438,7 @@ test(
         pool: db.pool,
         ownerId,
         review: async (instructions, input) => {
+          if (Object(input).purpose === 'review_requirement') return { review: 'clear' };
           if ('expiredConfirmation' in input && 'reply' in input)
             return {
               retiredReply:
@@ -1923,7 +2548,8 @@ test(
         verdict: Awaited<ReturnType<typeof trust.check>>,
         expected: Record<string, unknown>,
       ) => {
-        const { chatRevision, ...result } = verdict;
+        const { chatRevision, instructionRevision, validate, ...result } = verdict;
+        assert.equal(typeof validate, 'function');
         assert.deepEqual(result, expected);
       };
       const email = (to: string) => ({
@@ -2166,6 +2792,48 @@ test(
         },
       );
 
+      await t.test(
+        'a declined computer step is not asked again when only window content or refs differ',
+        async () => {
+          const turn = await begin('Send Ana the synthetic note in Mail.');
+          const press = (typed: string, ref: string) => ({
+            ref,
+            windowBinding: { window: 'w-1', state: 'synthetic-state' },
+            app: { bundle: 'com.apple.mail', name: 'Mail' },
+            control: { role: 'button', name: 'Send', window: 'Synthetic note' },
+            windowContext: typed,
+          });
+          const ended = await begin('Synthetic earlier request that ended.');
+          try {
+            const asked = await approved.request(turn, 'COMPUTER_PRESS', press('Hi Ana', '@s1:e1'));
+            assert.ok(asked && typeof asked === 'object' && appConfirmation in asked);
+            const first = await proposal(turn.turnId);
+            await finish(turn.turnId);
+            await confirm(first.id, false);
+            assert.equal((await stored(first.id)).status, 'declined');
+            await finish(ended.turnId, 'succeeded');
+            await db.pool.query(
+              `INSERT INTO approvals(id,owner_id,thread_id,turn_id,action,args,status,source_message_id,title)
+               SELECT $1,owner_id,thread_id,$2,action,$3::jsonb,'pending',source_message_id,title
+               FROM approvals WHERE id=$4`,
+              [randomUUID(), ended.turnId, press('Hi Ana!', '@s2:e1'), first.id],
+            );
+            await db.pool.query("UPDATE turns SET status='running' WHERE id=$1", [turn.turnId]);
+            const ran = calls.length;
+            await assert.rejects(
+              approved.request(turn, 'COMPUTER_PRESS', press('Hi Ana!', '@s2:e1'), {
+                allowed: true,
+              }),
+              /pending or uncertain outcome/,
+            );
+            assert.equal(calls.length, ran);
+          } finally {
+            await finish(turn.turnId, 'cancelled');
+            await finish(ended.turnId, 'cancelled');
+          }
+        },
+      );
+
       await t.test('a quoted permission cannot override a reported term mismatch', async () => {
         const turn = await begin('Email Ana the invoice for EUR 1200.');
         try {
@@ -2353,6 +3021,58 @@ test(
         await checkWith(declined);
         assert.deepEqual(unusable(), []);
         await finish(declined.turnId, 'cancelled');
+      });
+
+      await t.test('stopped Trust reviews do not log provider failures', async () => {
+        const { withFailureLog } = await import('../src/server/failure-log.ts');
+        for (const action of ['GMAIL_SEND_EMAIL', 'NOD_workspace_command']) {
+          const turn = await begin('Read the synthetic workspace and email Ana the result.');
+          const controller = new AbortController();
+          const stopped = new Error('Synthetic owner Stop.');
+          const provider = Object.assign(new Error('Synthetic review failed with HTTP 503.'), {
+            providerStatus: 503,
+          });
+          let enter!: () => void;
+          let release!: () => void;
+          const entered = new Promise<void>((resolve) => {
+            enter = resolve;
+          });
+          const released = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          const logged: Array<{ event: string; error: unknown }> = [];
+          const sink = (event: string, error: unknown) => {
+            logged.push({ event, error });
+          };
+          const checker = createTrust({
+            pool: db.pool,
+            ownerId,
+            review: async () => {
+              enter();
+              await released;
+              throw provider;
+            },
+          });
+          const args =
+            action === 'NOD_workspace_command' ? { command: 'pwd' } : email('ana@example.test');
+          const checking = withFailureLog(sink, () =>
+            checker.check(turn, action, args, controller.signal),
+          );
+          await entered;
+          controller.abort(stopped);
+          release();
+          await assert.rejects(checking, (error: unknown) => error === stopped);
+          assert.equal(logged.length, 0);
+
+          const failure = withFailureLog(sink, () => checker.check(turn, action, args));
+          if (action === 'NOD_workspace_command')
+            await assert.rejects(failure, (error: unknown) => error === provider);
+          else assert.equal((await failure).confirm, true);
+          assert.deepEqual(logged, [{ event: 'trust_check_failed', error: provider }]);
+          assert.equal(Object(logged[0]!.error).providerStatus, 503);
+          assert.match(Object(logged[0]!.error).message, /HTTP 503/);
+          await finish(turn.turnId, 'cancelled');
+        }
       });
 
       await t.test(
@@ -2670,19 +3390,37 @@ test(
           const entered = deferred();
           const release = deferred();
           let preferenceReads = 0;
+          const intercept = async (
+            run: (...args: Parameters<typeof db.pool.query>) => ReturnType<typeof db.pool.query>,
+            args: Parameters<typeof db.pool.query>,
+          ) => {
+            if (
+              typeof args[0] === 'string' &&
+              args[0].includes('SELECT notification_rule,rules') &&
+              ++preferenceReads === 2
+            ) {
+              entered.resolve();
+              await release.promise;
+            }
+            return run(...args);
+          };
           const pool = new Proxy(db.pool, {
             get(target, property) {
               if (property === 'query')
-                return async (...args: Parameters<typeof db.pool.query>) => {
-                  if (
-                    typeof args[0] === 'string' &&
-                    args[0].includes('SELECT notification_rule,rules') &&
-                    ++preferenceReads === 2
-                  ) {
-                    entered.resolve();
-                    await release.promise;
-                  }
-                  return target.query(...args);
+                return (...args: Parameters<typeof db.pool.query>) =>
+                  intercept(target.query.bind(target), args);
+              if (property === 'connect')
+                return async () => {
+                  const client = await target.connect();
+                  return new Proxy(client, {
+                    get(connection, key) {
+                      if (key === 'query')
+                        return (...args: Parameters<typeof db.pool.query>) =>
+                          intercept(connection.query.bind(connection), args);
+                      const value = Reflect.get(connection, key);
+                      return typeof value === 'function' ? value.bind(connection) : value;
+                    },
+                  });
                 };
               const value = Reflect.get(target, property);
               return typeof value === 'function' ? value.bind(target) : value;
@@ -2691,7 +3429,10 @@ test(
           const checking = createTrust({
             pool,
             ownerId,
-            review: async (_instructions, input) => ({ run: true, because: cite(input) }),
+            review: async (_instructions, input) =>
+              Object(input).purpose === 'review_requirement'
+                ? { review: 'clear' }
+                : { run: true, because: cite(input) },
           });
           const args = email('ana@example.test');
           const before = calls.length;
@@ -2713,6 +3454,587 @@ test(
           await finish(turn.turnId, 'cancelled');
         },
       );
+      await t.test(
+        'an old implicit draft reply retains restrictions without granting permission',
+        async () => {
+          const original = `Draft the synthetic email. Show it before sending. ${randomUUID()}`;
+          const channel = `synthetic-anchor-${randomUUID()}`;
+          const earlier = await begin(original, { channel });
+          const assistantId = randomUUID();
+          await db.pool.query(
+            "INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'assistant','Synthetic old draft.')",
+            [assistantId, ownerId, earlier.threadId, earlier.turnId],
+          );
+          await finish(earlier.turnId, 'succeeded');
+          const correction = 'Change the ending, then send it.';
+          const current = await begin(correction, { channel });
+          await db.pool.query(
+            'UPDATE messages m SET turn_id=u.id FROM turns u WHERE u.id=ANY($1::uuid[]) AND m.id=u.message_id',
+            [[earlier.turnId, current.turnId]],
+          );
+          await db.pool.query(
+            "UPDATE messages SET created_at=created_at-interval '2 days' WHERE turn_id=$1",
+            [earlier.turnId],
+          );
+          const capture = () =>
+            captureOwnerInstructions(
+              db.pool,
+              ownerId,
+              current.threadId,
+              [],
+              null,
+              new Date(Date.now() - 86_400_000),
+              current.turnId,
+            );
+          try {
+            const check = async () => {
+              const retained = (await capture())?.evidence.messages.find(
+                (message) => message.text === original,
+              );
+              assert.ok(retained);
+              assert.equal(retained.canAuthorize, false);
+            };
+            await check();
+            const checker = createTrust({
+              pool: db.pool,
+              ownerId,
+              review: async (_instructions, input) =>
+                Object(input).purpose === 'review_requirement'
+                  ? {
+                      review: Object(input).userMessages.some(
+                        (message: { text: string }) => message.text === original,
+                      )
+                        ? 'required'
+                        : 'clear',
+                    }
+                  : { run: true, because: correction },
+            });
+            await assert.rejects(
+              checker.check(current, 'NOD_browser', {
+                page: 'https://mail.example.test/compose',
+                control: { name: 'Send' },
+              }),
+              /complete message/,
+            );
+            await db.pool.query('UPDATE messages SET reply_to_message_id=$2 WHERE turn_id=$1', [
+              current.turnId,
+              assistantId,
+            ]);
+            await check();
+          } finally {
+            await finish(current.turnId, 'cancelled');
+          }
+        },
+      );
+
+      await t.test(
+        'a clear typed review permits only a current ordinary confirmation',
+        async () => {
+          const { jevPolicy } = await import('../src/server/trust-jev-policy.ts');
+          const originalRules = (
+            await db.pool.query('SELECT rules FROM preferences WHERE owner_id=$1', [ownerId])
+          ).rows[0].rules;
+          for (const mode of ['decision', 'Jev'])
+            for (const changeRules of [false, true]) {
+              const turn = await begin('Set the synthetic monthly limit to 100 dollars.');
+              const before = calls.length;
+              const checker = createTrust({
+                pool: db.pool,
+                ownerId,
+                review: async () => assert.fail('The decision check cannot switch to an LLM.'),
+                decisions: {
+                  check: async (request) => {
+                    if (changeRules)
+                      await db.pool.query('UPDATE preferences SET rules=$2 WHERE owner_id=$1', [
+                        ownerId,
+                        'Ask before changing the synthetic spending limit.',
+                      ]);
+                    if (mode === 'Jev') {
+                      request.forModel?.({ provider: 'typesafe', model: 'jev-1.14.0' });
+                      return {
+                        choice: 'message:0',
+                        probability: 1,
+                        model: {
+                          provider: 'typesafe',
+                          requested: 'jev-1.14.0',
+                          served: 'jev-1.14.0',
+                        },
+                        additional: Object.fromEntries(
+                          Object.keys(jevPolicy.features).map((name) => [
+                            name,
+                            { choice: false, probability: 1 },
+                          ]),
+                        ),
+                      };
+                    }
+                    return {
+                      trust: 'message:0',
+                      choice: 'message:0',
+                      probability: 1,
+                      additional: { messageReview: { choice: false, probability: 1 } },
+                    };
+                  },
+                },
+              });
+              try {
+                const proposed = async () => {
+                  const args = { monthlyUsd: 100 };
+                  const verdict = await checker.check(turn, 'NOD_limits_update', args);
+                  assert.equal(verdict.confirm, true);
+                  return approved.request(turn, 'NOD_limits_update', args, {
+                    allowed: false,
+                    expectedChatRevision: verdict.chatRevision,
+                    validate: verdict.validate,
+                  });
+                };
+                if (changeRules) {
+                  await assert.rejects(proposed(), /owner instructions.*changed/);
+                  assert.equal(await proposal(turn.turnId), undefined);
+                } else {
+                  await proposed();
+                  assert.equal((await proposal(turn.turnId)).status, 'pending');
+                }
+                assert.equal(calls.length, before);
+              } finally {
+                await db.pool.query('UPDATE preferences SET rules=$2 WHERE owner_id=$1', [
+                  ownerId,
+                  originalRules,
+                ]);
+                await db.pool.query("UPDATE approvals SET status='expired' WHERE turn_id=$1", [
+                  turn.turnId,
+                ]);
+                await finish(turn.turnId, 'cancelled');
+              }
+            }
+        },
+      );
+
+      await t.test(
+        'an unverified Perplexity model cannot create a generic send approval',
+        async () => {
+          const expected = 'perplexity/pplx-decider-v1.2-20261016';
+          const [tool] = appTools(
+            {
+              tools: {
+                GMAIL_SEND_EMAIL: {
+                  description: 'Send a synthetic message.',
+                  inputSchema: {
+                    type: 'object',
+                    properties: { recipient_email: { type: 'string' } },
+                    additionalProperties: false,
+                  },
+                },
+              },
+            },
+            'synthetic-connection',
+          );
+          const readArgs = appToolArgs(
+            tool,
+            { recipient_email: 'recipient@example.test' },
+            'synthetic-connection',
+          );
+          for (const served of [expected, 'perplexity/pplx-decider-v1.3', undefined]) {
+            const turn = await begin('Prepare the synthetic message and show it before sending.');
+            const before = calls.length;
+            let checks = 0;
+            const checker = createTrust({
+              pool: db.pool,
+              ownerId,
+              review: async () => assert.fail('The decision check cannot switch to an LLM.'),
+              decisions: createDecisionModel({
+                resolve: async () => ({
+                  provider: 'openrouter',
+                  key: 'synthetic-decision-key',
+                  model: 'perplexity/pplx-decider-v1.2',
+                }),
+                fetch: async (_url, init) => {
+                  checks++;
+                  const request = JSON.parse(String(init?.body));
+                  return Response.json({
+                    model: served,
+                    answers: Object.fromEntries(
+                      Object.entries(request.questions).map(([name, value]) => {
+                        const question = value as { criteria: Record<string, string> };
+                        const choice = name === 'trust' ? 'ask' : String(name === 'readOnly');
+                        return [
+                          name,
+                          {
+                            type: 'choice',
+                            choice,
+                            probabilities: Object.fromEntries(
+                              Object.keys(question.criteria).map((key) => [
+                                key,
+                                Number(key === choice),
+                              ]),
+                            ),
+                          },
+                        ];
+                      }),
+                    ),
+                    usage: { input_tokens: 100 },
+                  });
+                },
+              }),
+            });
+            try {
+              const proposed = async () => {
+                const args = {
+                  page: 'https://mail.example.test/compose',
+                  control: { name: 'Send' },
+                };
+                const verdict = await checker.check(turn, 'NOD_browser', args);
+                assert.equal(verdict.confirm, true);
+                return approved.request(turn, 'NOD_browser', args, {
+                  allowed: false,
+                  expectedChatRevision: verdict.chatRevision,
+                  validate: verdict.validate,
+                });
+              };
+              if (served === expected) {
+                await proposed();
+                assert.equal((await proposal(turn.turnId)).status, 'pending');
+              } else {
+                await assert.rejects(
+                  proposed(),
+                  (error) =>
+                    Object(error).code === 'decision_model_mismatch' &&
+                    String(error).includes(expected),
+                );
+                assert.equal(await proposal(turn.turnId), undefined);
+              }
+              assert.equal(
+                await checker.readOnly(
+                  tool.action,
+                  readArgs,
+                  { description: tool.description, inputSchema: tool.schema },
+                  AbortSignal.timeout(1000),
+                ),
+                served === expected,
+              );
+              assert.equal(checks, 2);
+              assert.equal(calls.length, before);
+            } finally {
+              await db.pool.query("UPDATE approvals SET status='expired' WHERE turn_id=$1", [
+                turn.turnId,
+              ]);
+              await finish(turn.turnId, 'cancelled');
+            }
+          }
+        },
+      );
+
+      await t.test(
+        'a failed message review cannot create an unsupported generic confirmation',
+        async () => {
+          for (const mode of ['selection', 'refusal', 'Jev rule', 'Jev unknown effect']) {
+            for (const action of [
+              'GMAIL_SEND_EMAIL',
+              mode === 'Jev unknown effect' ? 'CONNECTED_MCP_CALL' : 'NOD_browser',
+            ]) {
+              const turn = await begin(`Show the synthetic draft before sending ${randomUUID()}.`);
+              const failure = Object.assign(
+                new Error('Synthetic review selection is unavailable.'),
+                { status: 503 },
+              );
+              const review: import('../src/ports/decisions.ts').ModelReview = async () =>
+                assert.fail('This review is unavailable.');
+              if (mode === 'selection')
+                review.select = async () => {
+                  throw failure;
+                };
+              const checker = createTrust({
+                pool: db.pool,
+                ownerId,
+                review,
+                ...(mode === 'refusal'
+                  ? { decisions: { check: async () => ({ refused: true }) } }
+                  : mode.startsWith('Jev')
+                    ? {
+                        decisions: {
+                          check: async (request) => {
+                            const wire = request.forModel!({
+                              provider: 'typesafe',
+                              model: 'jev-1.14.0',
+                            });
+                            return {
+                              choice:
+                                mode === 'Jev rule'
+                                  ? 'rule'
+                                  : wire.question.choices.find((entry) =>
+                                      String(entry.value).startsWith('message:'),
+                                    )!.value,
+                              probability: 1,
+                              model: {
+                                provider: 'typesafe',
+                                requested: 'jev-1.14.0',
+                                served: 'jev-1.14.0',
+                              },
+                              additional: Object.fromEntries(
+                                (wire.additionalQuestions ?? []).map(({ name }) => [
+                                  name,
+                                  {
+                                    choice:
+                                      name === 'effect' ? 'unknown' : name === 'message_review',
+                                    probability: 0.99,
+                                  },
+                                ]),
+                              ),
+                            };
+                          },
+                        },
+                      }
+                    : {}),
+              });
+              const before = calls.length;
+              const rules = (
+                await db.pool.query('SELECT rules FROM preferences WHERE owner_id=$1', [ownerId])
+              ).rows[0].rules;
+              if (mode === 'Jev rule')
+                await db.pool.query('UPDATE preferences SET rules=$2 WHERE owner_id=$1', [
+                  ownerId,
+                  'Show email drafts before sending.',
+                ]);
+              try {
+                if (action === 'GMAIL_SEND_EMAIL')
+                  assert.equal(
+                    (await checker.check(turn, action, email('review-failure@example.test')))
+                      .confirm,
+                    true,
+                  );
+                else
+                  await assert.rejects(
+                    checker.check(turn, action, {
+                      page: 'https://mail.example.test/compose',
+                      control: { name: 'Send' },
+                    }),
+                    (error) =>
+                      mode === 'selection'
+                        ? error === failure && Object(error).status === 503
+                        : /complete message/.test(String(error)),
+                  );
+                assert.equal(calls.length, before);
+                assert.equal(await proposal(turn.turnId), undefined);
+              } finally {
+                await db.pool.query('UPDATE preferences SET rules=$2 WHERE owner_id=$1', [
+                  ownerId,
+                  rules,
+                ]);
+              }
+              await finish(turn.turnId, 'cancelled');
+            }
+          }
+        },
+      );
+
+      await t.test(
+        'a cleared review cannot survive an owner edit while permission fails',
+        async () => {
+          const turn = await begin('Show this synthetic draft before sending.');
+          const originalRules = (
+            await db.pool.query('SELECT rules FROM preferences WHERE owner_id=$1', [ownerId])
+          ).rows[0].rules;
+          const checker = createTrust({
+            pool: db.pool,
+            ownerId,
+            review: async (_instructions, input) => {
+              if (Object(input).purpose === 'review_requirement') return { review: 'clear' };
+              await db.pool.query('UPDATE preferences SET rules=$2 WHERE owner_id=$1', [
+                ownerId,
+                'Show the complete message before sending.',
+              ]);
+              throw Object.assign(new Error('Synthetic permission service failed.'), {
+                status: 502,
+              });
+            },
+          });
+          const before = calls.length;
+          try {
+            await assert.rejects(
+              checker.check(turn, 'NOD_browser', {
+                page: 'https://mail.example.test/compose',
+                control: { name: 'Send' },
+              }),
+              /owner instructions.*changed/,
+            );
+            assert.equal(calls.length, before);
+            assert.equal(await proposal(turn.turnId), undefined);
+          } finally {
+            await db.pool.query('UPDATE preferences SET rules=$2 WHERE owner_id=$1', [
+              ownerId,
+              originalRules,
+            ]);
+            await finish(turn.turnId, 'cancelled');
+          }
+        },
+      );
+
+      await t.test(
+        'a cleared review is checked again when a generic question is saved',
+        async () => {
+          const turn = await begin('Show the synthetic draft before sending it.');
+          const connectionId = randomUUID();
+          const draftId = randomUUID();
+          const source = (
+            await db.pool.query("SELECT id FROM messages WHERE turn_id=$1 AND role='user'", [
+              turn.turnId,
+            ])
+          ).rows[0];
+          await db.pool.query(
+            "INSERT INTO app_connections(id,owner_id,slug,account_id,provider_id,account_active,watch_revision) VALUES($1,$2,'gmail','synthetic-scope-account','fixture',true,0)",
+            [connectionId, ownerId],
+          );
+          await db.pool.query(
+            `INSERT INTO draft_instructions(id,owner_id,thread_id,turn_id,connection_id,binding,source_ids,draft_id,target,complete)
+          VALUES($1,$2,$3,$4,$5,$6,$7,'synthetic-scope-draft',$8,true)`,
+            [
+              draftId,
+              ownerId,
+              turn.threadId,
+              turn.turnId,
+              connectionId,
+              JSON.stringify(['synthetic-scope-account', 'fixture', null, 0]),
+              [source.id],
+              { recipient_email: 'scope-review@example.test' },
+            ],
+          );
+          const checker = createTrust({
+            pool: db.pool,
+            ownerId,
+            review: async (_instructions, input) => {
+              if (Object(input).purpose === 'review_requirement') return { review: 'clear' };
+              throw new Error('Synthetic permission request failed after a complete clear review.');
+            },
+          });
+          const args = { page: 'https://mail.example.test/compose', control: { name: 'Send' } };
+          const before = calls.length;
+          try {
+            const verdict = await checker.check(turn, 'NOD_browser', args);
+            assert.equal(verdict.confirm, true);
+            await assert.rejects(
+              approved.request(turn, 'NOD_browser', args, {
+                allowed: false,
+                expectedChatRevision: verdict.chatRevision,
+                validate: verdict.validate,
+                prepareConfirmation: async () => {
+                  await db.pool.query(
+                    'UPDATE draft_instructions SET source_ids=ARRAY[]::uuid[] WHERE id=$1',
+                    [draftId],
+                  );
+                  return {};
+                },
+              }),
+              /draft sources changed/,
+            );
+            assert.equal(calls.length, before);
+            assert.equal(await proposal(turn.turnId), undefined);
+          } finally {
+            await db.pool.query('DELETE FROM draft_instructions WHERE id=$1', [draftId]);
+            await db.pool.query('DELETE FROM app_connections WHERE id=$1', [connectionId]);
+            await finish(turn.turnId, 'cancelled');
+          }
+        },
+      );
+
+      await t.test(
+        'the first owner rule write waits for a proposal that checked default rules',
+        async () => {
+          const original = (
+            await db.pool.query('SELECT * FROM preferences WHERE owner_id=$1', [ownerId])
+          ).rows[0];
+          const turn = await begin('Review this synthetic message before sending.');
+          await db.pool.query('DELETE FROM preferences WHERE owner_id=$1', [ownerId]);
+          const checker = createTrust({
+            pool: db.pool,
+            ownerId,
+            review: async (_instructions, input) => {
+              if (Object(input).purpose === 'review_requirement') return { review: 'clear' };
+              throw new Error('Synthetic permission request failed after a clear review.');
+            },
+          });
+          const entered = deferred();
+          const release = deferred();
+          let outcome: Promise<unknown> | undefined;
+          let update: ReturnType<typeof request> | undefined;
+          let updated = false;
+          let validationPid: number | undefined;
+          const before = calls.length;
+          try {
+            const args = { page: 'https://mail.example.test/compose', control: { name: 'Send' } };
+            const verdict = await checker.check(turn, 'NOD_browser', args);
+            await db.pool.query('DELETE FROM preferences WHERE owner_id=$1', [ownerId]);
+            outcome = approved.request(turn, 'NOD_browser', args, {
+              allowed: false,
+              expectedChatRevision: verdict.chatRevision,
+              validate: (client) =>
+                verdict.validate(
+                  new Proxy(client, {
+                    get(connection, key) {
+                      if (key === 'query')
+                        return async (...args: Parameters<typeof connection.query>) => {
+                          const result = await connection.query(...args);
+                          if (
+                            typeof args[0] === 'string' &&
+                            args[0].includes('SELECT notification_rule,rules') &&
+                            args[0].includes('FOR SHARE')
+                          ) {
+                            validationPid = (
+                              await connection.query('SELECT pg_backend_pid() AS pid')
+                            ).rows[0].pid;
+                            entered.resolve();
+                            await release.promise;
+                          }
+                          return result;
+                        };
+                      const value = Reflect.get(connection, key);
+                      return typeof value === 'function' ? value.bind(connection) : value;
+                    },
+                  }),
+                ),
+            });
+            await entered.promise;
+            update = request('PATCH', '/api/preferences', {
+              rules: 'Show the complete current message before sending.',
+            }).then((response) => {
+              updated = true;
+              return response;
+            });
+            let blocked = false;
+            for (let attempt = 0; attempt < 100 && !updated && !blocked; attempt++) {
+              blocked =
+                (
+                  await db.pool.query(
+                    `SELECT 1 FROM pg_stat_activity WHERE datname=current_database()
+                   AND query LIKE 'INSERT INTO preferences(owner_id,notification_rule,%'
+                   AND $1=ANY(pg_blocking_pids(pid))`,
+                    [validationPid],
+                  )
+                ).rowCount! > 0;
+              if (!blocked && !updated) await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            assert.equal(blocked, true);
+            assert.equal(updated, false);
+            assert.equal(calls.length, before);
+            release.resolve();
+            await outcome;
+            const response = await update;
+            assert.equal(response.statusCode, 200, response.body);
+            assert.equal((await proposal(turn.turnId)).status, 'pending');
+            assert.equal(calls.length, before);
+          } finally {
+            release.resolve();
+            await outcome?.catch(() => {});
+            await update;
+            await finish(turn.turnId, 'cancelled');
+            await db.pool.query('DELETE FROM preferences WHERE owner_id=$1', [ownerId]);
+            if (original)
+              await db.pool.query(
+                'INSERT INTO preferences SELECT * FROM jsonb_populate_record(NULL::preferences,$1::jsonb)',
+                [JSON.stringify(original)],
+              );
+          }
+        },
+      );
+
       await t.test(
         'onboarding reads require a strict decision and retain owner rules without message authority',
         async () => {
@@ -3327,6 +4649,10 @@ test(
           );
           compareVerdict(unrelated, { confirm: true, reason: 'unrequested' });
           assert.equal(unrelated.chatRevision, originalMessageId);
+          assert.deepEqual(unrelated.instructionRevision, {
+            rules: '',
+            chat: { threadId: resumed.threadId, id: originalMessageId },
+          });
           aligned = () => ({ run: true, because: requestText });
           const followOn = await trust.check(
             resumed,
@@ -3821,6 +5147,7 @@ test(
               pool: db.pool,
               ownerId,
               review: async (_instructions, input) => {
+                if (Object(input).purpose === 'review_requirement') return { review: 'clear' };
                 inputs.push(input);
                 return { run: false };
               },
@@ -3856,7 +5183,7 @@ test(
                   path: '/Users/ana/Documents/board/todo.md',
                 }),
               );
-            await checker.check(
+            const update = checker.check(
               owner,
               'NOD_schedule_update',
               { title: 'Synthetic renamed board' },
@@ -3868,6 +5195,8 @@ test(
                 evidence: authority,
               },
             );
+            if (mode === 'llm') await update;
+            else await assert.rejects(update, /complete message/);
           }
           for (const input of inputs.filter((value) => value.scheduledInstructions)) {
             assert.equal(input.scheduledInstructions[0].canAuthorize, false);
@@ -4038,10 +5367,12 @@ test(
             await begin('Synthetic event', { source: 'event' }),
             await attachSchedule(await begin('Synthetic scheduled work', { source: 'schedule' })),
           ]) {
-            compareVerdict(await trust.check(turn, 'GMAIL_SEND_EMAIL', send), {
+            const checked = await trust.check(turn, 'GMAIL_SEND_EMAIL', send);
+            compareVerdict(checked, {
               confirm: true,
               reason: 'rule',
             });
+            assert.equal(checked.instructionRevision.rules, rules);
             assert.equal(reviews.at(-1)?.userRules, rules);
             assert.ok(prompts.at(-1)!.startsWith(plain));
             assert.match(prompts.at(-1)!, /userRules/);
@@ -4264,7 +5595,15 @@ test(
             [summaryMessageId, ownerId, hotel.threadId, hotel.turnId],
           );
           await finish(hotel.turnId, 'succeeded');
-          await trust.check(turn, 'GMAIL_SEND_EMAIL', { to: 'hotel@example.test' });
+          const checked = await trust.check(turn, 'GMAIL_SEND_EMAIL', { to: 'hotel@example.test' });
+          assert.deepEqual(checked.instructionRevision, {
+            rules: '',
+            task: {
+              id: task.id,
+              revision: (await db.pool.query('SELECT revision FROM tasks WHERE id=$1', [task.id]))
+                .rows[0].revision,
+            },
+          });
           const started = reviews.at(-1)!.userMessages.map((item: { text: string }) => item.text);
           assert.deepEqual(started.slice(-2), [
             'Read my fixture flight dates.',
