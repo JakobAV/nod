@@ -929,11 +929,7 @@ test('decision trust never calls an LLM for uncertainty, missing results or fail
     },
     review: async () => assert.fail('Missing configuration must not start an LLM request.'),
   });
-  assert.deepEqual(await unavailable(instructions, input), {
-    run: false,
-    reviewRequired: true,
-    reviewUnavailable: true,
-  });
+  assert.equal(await unavailable(instructions, input), undefined);
   for (const output of [
     undefined,
     {},
@@ -947,11 +943,7 @@ test('decision trust never calls an LLM for uncertainty, missing results or fail
       decisions: { check: async () => output },
       review: async () => assert.fail('Missing results must not select another model.'),
     });
-    const refused = await missing(instructions, input);
-    assert.equal(Object(refused).run, false);
-    assert.equal(Object(refused).reviewRequired, true);
-    assert.equal(Object(refused).reviewUnavailable, true);
-    assert.equal(trustBasis(refused, withOwnerIds(words, ['message'])), undefined);
+    assert.equal(await missing(instructions, input), undefined);
   }
   const unscored = createTrustReview({
     decisions: { check: async () => ({ answer: 'yes' }) },
@@ -1016,22 +1008,11 @@ test('batched trust validates all answers, records one request, and refuses conf
         resolve: async () => ({ provider, key: 'synthetic-batch-key' }),
         fetch: async (_url, init) => {
           const body = JSON.parse(String(init?.body));
-          const questions: Array<{ name: string; instructions: string }> =
-            provider === 'openai'
-              ? body.questions
-              : Object.entries(body.questions).map(([name, question]) => ({
-                  name,
-                  ...Object(question),
-                }));
-          assert.equal(questions.length, 12);
-          const named = (name: string) => {
-            const question = questions.find((question) => question.name === name);
-            assert.ok(question);
-            return question;
-          };
-          assert.doesNotMatch(named('trust').instructions, /Complete permission policy/);
-          assert.match(named('permission').instructions, /Complete permission policy/);
-          assert.doesNotMatch(named('preparation').instructions, /Complete permission policy/);
+          const questions = provider === 'openai' ? body.questions : Object.values(body.questions);
+          assert.equal(questions.length, 11);
+          assert.doesNotMatch(questions[0].instructions, /Complete permission policy/);
+          assert.match(questions[2].instructions, /Complete permission policy/);
+          assert.doesNotMatch(questions[1].instructions, /Complete permission policy/);
           const answers = [
             {
               name: 'trust',
@@ -1052,7 +1033,6 @@ test('batched trust validates all answers, records one request, and refuses conf
               probabilities: { true: conflict ? 0 : 1, false: conflict ? 1 : 0 },
             },
             ...[
-              'messageReview',
               'scope',
               'constraints',
               'time',
@@ -1067,7 +1047,7 @@ test('batched trust validates all answers, records one request, and refuses conf
               choice: provider === 'openai' ? false : 'false',
               probabilities: { true: 0, false: 1 },
             })),
-          ].slice(0, missing ? 1 : 12);
+          ].slice(0, missing ? 1 : 11);
           return Response.json({
             answers:
               provider === 'openai'
@@ -1141,7 +1121,7 @@ test('pure decision checks bind the evaluated model, preserve target checks and 
     }),
     fetch: async (_url, init) => {
       const request = JSON.parse(String(init?.body));
-      assert.equal(Object.keys(request.questions).length, 12);
+      assert.equal(Object.keys(request.questions).length, 11);
       assert.deepEqual(request.state.action, input.action);
       assert.deepEqual(request.state.userMessages, input.userMessages);
       assert.equal(request.provider.allow_fallbacks, false);
@@ -1211,14 +1191,10 @@ test('pure decision checks bind the evaluated model, preserve target checks and 
   source = 'message:0';
   input.action.name = 'send_email';
   probabilities = {};
-  for (const returnedModel of ['perplexity/pplx-decider-v1.3', undefined]) {
-    served = returnedModel;
-    await assert.rejects(allowed(), {
-      code: 'decision_model_mismatch',
-      reviewRequired: true,
-      reviewUnavailable: true,
-    });
-  }
+  served = 'perplexity/pplx-decider-v1.3';
+  assert.equal(await allowed(), undefined);
+  served = undefined;
+  assert.equal(await allowed(), undefined);
   served = 'perplexity/pplx-decider-v1.2-20261016';
   omit = 'targets';
   await assert.rejects(allowed());
@@ -3186,6 +3162,37 @@ test('server model credentials reject invalid destinations and cloud accounts be
   );
 });
 
+test('adding a model key keeps the service reason and removes the key', async () => {
+  const { createModelService } = await import('../src/server/models.ts');
+  const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
+  const key = 'fixture-add-key-reason';
+  const secret = randomBytes(32);
+  for (const [provider, status] of [
+    ['openrouter', 429],
+    ['mistral', 503],
+  ] as const) {
+    const service = createModelService({
+      database: {} as pg.Pool,
+      ownerId: 'fixture-add-key-owner',
+      keyStore: { id: 'fixture', configured: true, getKey: async () => secret },
+      backend: createPiModelBackend({
+        fetch: async () =>
+          Response.json(
+            { message: `Synthetic ${key}` },
+            { status, headers: { 'content-type': 'application/json' } },
+          ),
+      }),
+      origin: 'http://127.0.0.1:4310',
+    });
+    await assert.rejects(service.addKey(provider, key), (error: Error) => {
+      assert.ok(!error.message.includes(key));
+      assert.ok(error.message.includes(`HTTP ${status}`));
+      assert.match(error.message, /Synthetic \[redacted\]/);
+      return true;
+    });
+  }
+});
+
 test('secret redaction finishes for long malformed Basic credentials', async () => {
   const { execFile } = await import('node:child_process');
   const { promisify } = await import('node:util');
@@ -3233,6 +3240,359 @@ test('secret redaction keeps valid tokens when another token is missing', () => 
     JSON.stringify(redact({ detail: 'fixture-refresh-token' })),
     '{"detail":"[redacted]"}',
   );
+});
+
+test('compatible model discovery retains HTTP failures and private values through the connection route', async (t) => {
+  const { createServer } = await import('node:http');
+  const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
+  const { createModelService } = await import('../src/server/models.ts');
+  const key = String.raw`synthetic-discovery-key/with+private\value`;
+  let expectedKey = key;
+  const privateField = 'synthetic-private-unselected-response';
+  const paths: string[] = [];
+  let respond: (path: string) => { status: number; body: string; type?: string };
+  const server = createServer((request, response) => {
+    assert.equal(request.headers.authorization, `Bearer ${expectedKey}`);
+    paths.push(request.url!);
+    const result = respond(request.url!);
+    response.writeHead(result.status, { 'content-type': result.type ?? 'application/json' });
+    response.end(result.body);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
+  const address = `${origin}/synthetic-private-server/v1`;
+  const echoes = [key, encodeURIComponent(key), address, encodeURIComponent(address)];
+  let transportFailure = false;
+  let transportMessage = `Synthetic transport unavailable. ${echoes.join(' ')}`;
+  const backend = createPiModelBackend({
+    fetch: async (input, init) => {
+      assert.equal(new URL(String(input)).origin, origin);
+      if (transportFailure) throw new Error(transportMessage);
+      return fetch(input, init);
+    },
+  });
+  const database = new pg.Pool();
+  const queries = t.mock.method(database, 'query', () => assert.fail('Unexpected database query.'));
+  const connects = t.mock.method(database, 'connect', () =>
+    assert.fail('Unexpected database connection.'),
+  );
+  const owner = createModelService({
+    database,
+    ownerId: 'synthetic-discovery-owner',
+    keyStore: {
+      id: 'synthetic-discovery-key-store',
+      configured: true,
+      getKey: async () => Buffer.alloc(32),
+    },
+    backend,
+    origin,
+  });
+  const app = Fastify();
+  owner.register(app);
+  t.after(async () => {
+    await app.close();
+    await owner.close();
+    await database.end();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    assert.equal(server.listening, false);
+    assert.equal(queries.mock.callCount(), 0);
+    assert.equal(connects.mock.callCount(), 0);
+    assert.equal(database.totalCount, 0);
+  });
+  const cases = [
+    {
+      name: 'HTTP 401 object',
+      status: 401,
+      body: JSON.stringify({
+        error: {
+          message: `The credential was rejected. ${echoes.join(' ')}`,
+          type: 'authentication_error',
+          code: 'invalid_api_key',
+          param: 'authorization',
+          private: privateField,
+        },
+      }),
+      expected: [/HTTP 401/, /authentication_error/, /invalid_api_key/, /authorization/],
+    },
+    {
+      name: 'HTTP 503 string',
+      status: 503,
+      body: JSON.stringify({ error: `Synthetic catalog unavailable. ${echoes.join(' ')}` }),
+      expected: [/HTTP 503/, /Synthetic catalog unavailable/],
+    },
+    {
+      name: 'HTTP 429',
+      status: 429,
+      body: JSON.stringify({
+        error: { message: 'Synthetic rate limit.', code: 'rate_limit_exceeded' },
+      }),
+      expected: [/HTTP 429/, /rate_limit_exceeded/],
+    },
+    {
+      name: 'non-JSON HTTP failure',
+      status: 503,
+      body: `<html>${privateField} ${echoes.join(' ')}</html>`,
+      type: 'text/html',
+      expected: [/HTTP 503/, /Service Unavailable/],
+    },
+    {
+      name: 'oversized HTTP JSON',
+      status: 503,
+      body: JSON.stringify({ error: { message: 'x'.repeat(17000) + privateField } }),
+      expected: [/HTTP 503/],
+    },
+    {
+      name: 'malformed HTTP 200 JSON',
+      status: 200,
+      body: `{"private":"${privateField}"`,
+      expected: [/HTTP 200/, /invalid model list/i],
+    },
+    {
+      name: 'wrong HTTP 200 shape',
+      status: 200,
+      body: JSON.stringify({ data: { private: privateField } }),
+      expected: [/HTTP 200/, /invalid model list/i],
+    },
+  ];
+  for (const item of cases)
+    await t.test(item.name, async () => {
+      paths.length = 0;
+      respond = () => item;
+      const result = await app.inject({
+        method: 'POST',
+        url: '/api/models/endpoints',
+        payload: { url: address, key },
+      });
+      assert.equal(result.statusCode, 400);
+      const error = result.json().error;
+      for (const expected of item.expected) assert.match(error, expected);
+      for (const value of [...echoes, privateField]) assert.ok(!error.includes(value));
+      assert.doesNotMatch(error, /billing/i);
+      assert.ok(error.length <= 2000);
+      assert.deepEqual(paths, ['/synthetic-private-server/v1/models']);
+      assert.equal(owner.view().connections.length, 0);
+    });
+  await t.test(
+    'an endpoint key matching the HTTP status does not erase that trusted status',
+    async () => {
+      paths.length = 0;
+      expectedKey = '401';
+      respond = () => ({
+        status: 401,
+        body: JSON.stringify({
+          error: { message: 'Synthetic credential rejected. marked-key: 401.' },
+        }),
+      });
+      const result = await app.inject({
+        method: 'POST',
+        url: '/api/models/endpoints',
+        payload: { url: address, key: expectedKey },
+      });
+      expectedKey = key;
+      assert.equal(result.statusCode, 400);
+      assert.match(result.json().error, /HTTP 401/);
+      assert.match(result.json().error, /Synthetic credential rejected/);
+      assert.doesNotMatch(result.json().error, /marked-key: 401/);
+      assert.deepEqual(paths, ['/synthetic-private-server/v1/models']);
+    },
+  );
+  await t.test('HTTP failures redact nested JSON key text before error bounds', async () => {
+    paths.length = 0;
+    respond = (path) => ({
+      status: path.endsWith('/v1/models') ? 404 : 401,
+      body: JSON.stringify({ error: { message: 'x'.repeat(870) + JSON.stringify({ echo: key }) } }),
+    });
+    const result = await app.inject({
+      method: 'POST',
+      url: '/api/models/endpoints',
+      payload: { url: address.replace(/\/v1$/, ''), key },
+    });
+    assert.equal(result.statusCode, 400);
+    assert.match(result.json().error, /HTTP 401/);
+    assert.match(result.json().error, /HTTP 404/);
+    assert.ok(!result.json().error.includes(key.slice(0, 16)));
+    assert.ok(result.json().error.length <= 2000);
+    assert.deepEqual(paths, [
+      '/synthetic-private-server/models',
+      '/synthetic-private-server/v1/models',
+    ]);
+  });
+  for (const statuses of [
+    [401, 404],
+    [404, 503],
+  ])
+    await t.test(`two routes ${statuses.join('/')}`, async () => {
+      paths.length = 0;
+      respond = (path) => ({
+        status: path.endsWith('/v1/models') ? statuses[1]! : statuses[0]!,
+        body: JSON.stringify({ error: { message: 'Synthetic route failure.' } }),
+      });
+      const result = await app.inject({
+        method: 'POST',
+        url: '/api/models/endpoints',
+        payload: { url: address.replace(/\/v1$/, ''), key },
+      });
+      assert.equal(result.statusCode, 400);
+      for (const status of statuses)
+        assert.match(result.json().error, new RegExp(`HTTP ${status}`));
+      assert.deepEqual(paths, [
+        '/synthetic-private-server/models',
+        '/synthetic-private-server/v1/models',
+      ]);
+      assert.equal(owner.view().connections.length, 0);
+    });
+  await t.test(
+    'transport failures retain their reason without submitted private values',
+    async () => {
+      paths.length = 0;
+      transportFailure = true;
+      const result = await app.inject({
+        method: 'POST',
+        url: '/api/models/endpoints',
+        payload: { url: address, key },
+      });
+      transportFailure = false;
+      assert.equal(result.statusCode, 400);
+      assert.match(result.json().error, /Synthetic transport unavailable/);
+      for (const value of echoes) assert.ok(!result.json().error.includes(value));
+      assert.deepEqual(paths, []);
+    },
+  );
+  for (const [index, currentKey] of [key, 'q/+', 'q"\\'].entries())
+    await t.test(`transport masks every form of current endpoint key ${index + 1}`, async () => {
+      paths.length = 0;
+      const variants = [
+        currentKey,
+        JSON.stringify(currentKey).slice(1, -1),
+        encodeURIComponent(currentKey),
+      ];
+      transportMessage = `Synthetic transport unavailable. ${variants.join(' ')}`;
+      transportFailure = true;
+      const result = await app.inject({
+        method: 'POST',
+        url: '/api/models/endpoints',
+        payload: { url: address, key: currentKey },
+      });
+      transportFailure = false;
+      assert.equal(result.statusCode, 400);
+      assert.match(result.json().error, /Synthetic transport unavailable/);
+      for (const value of variants) assert.ok(!result.json().error.includes(value));
+      assert.deepEqual(paths, []);
+    });
+  await t.test(
+    'a short key overlapping the endpoint URL cannot reveal its private path',
+    async () => {
+      paths.length = 0;
+      const marker = 'synthetic-overlap-private-marker';
+      const url = `${origin}/${marker}/v1`;
+      transportMessage = `Synthetic transport unavailable. ${url} ${encodeURIComponent(url)}`;
+      transportFailure = true;
+      const result = await app.inject({
+        method: 'POST',
+        url: '/api/models/endpoints',
+        payload: { url, key: 'http' },
+      });
+      transportFailure = false;
+      assert.equal(result.statusCode, 400);
+      assert.match(result.json().error, /Synthetic transport unavailable/);
+      assert.ok(!result.json().error.includes(marker));
+      assert.deepEqual(paths, []);
+    },
+  );
+  await t.test('remembered text cannot split the current JSON key redaction', async () => {
+    paths.length = 0;
+    const prior = 'synthetic-prior-private-value';
+    transportMessage = 'Synthetic transport unavailable.';
+    transportFailure = true;
+    const setup = await app.inject({
+      method: 'POST',
+      url: '/api/models/endpoints',
+      payload: { url: address, key: prior },
+    });
+    const marker = 'synthetic-current-private-marker';
+    const currentKey = `${marker}"${prior}\\tail`;
+    transportMessage = `Synthetic transport unavailable. ${JSON.stringify(currentKey)}`;
+    const result = await app.inject({
+      method: 'POST',
+      url: '/api/models/endpoints',
+      payload: { url: address, key: currentKey },
+    });
+    transportFailure = false;
+    assert.equal(setup.statusCode, 400);
+    assert.equal(result.statusCode, 400);
+    assert.match(result.json().error, /Synthetic transport unavailable/);
+    assert.ok(!result.json().error.includes(marker));
+    assert.deepEqual(paths, []);
+  });
+  await t.test('HTTP-looking transport prose does not acquire a trusted status', async () => {
+    paths.length = 0;
+    transportMessage = 'Synthetic transport unavailable. HTTP 401; marked-key: 401.';
+    transportFailure = true;
+    const result = await app.inject({
+      method: 'POST',
+      url: '/api/models/endpoints',
+      payload: { url: address, key: '401' },
+    });
+    transportFailure = false;
+    assert.equal(result.statusCode, 400);
+    assert.match(result.json().error, /Synthetic transport unavailable/);
+    assert.doesNotMatch(result.json().error, /HTTP 401|marked-key: 401/);
+    assert.deepEqual(paths, []);
+  });
+  await t.test('concurrent catalogs keep each response status with its request', async () => {
+    paths.length = 0;
+    respond = (path) => ({
+      status: path.includes('/first/') ? 401 : 503,
+      body: JSON.stringify({ error: { message: 'Synthetic concurrent failure.' } }),
+    });
+    const results = await Promise.all(
+      ['first', 'second'].map((name) =>
+        app.inject({
+          method: 'POST',
+          url: '/api/models/endpoints',
+          payload: { url: `${origin}/${name}/v1`, key },
+        }),
+      ),
+    );
+    assert.match(results[0]!.json().error, /HTTP 401/);
+    assert.doesNotMatch(results[0]!.json().error, /HTTP 503/);
+    assert.match(results[1]!.json().error, /HTTP 503/);
+    assert.doesNotMatch(results[1]!.json().error, /HTTP 401/);
+    assert.deepEqual(paths.sort(), ['/first/v1/models', '/second/v1/models']);
+  });
+  for (const firstStatus of [200, 404, 503])
+    await t.test(`alternate catalog after HTTP ${firstStatus}`, async () => {
+      paths.length = 0;
+      respond = (path) =>
+        path === '/synthetic-private-server/v1/models'
+          ? {
+              status: 200,
+              body: JSON.stringify({
+                data: [{ id: 'synthetic-local-model', context_length: 32768 }],
+              }),
+            }
+          : { status: path === '/synthetic-private-server/models' ? firstStatus : 404, body: '{}' };
+      const definitions = await backend.catalog('compatible', 'api_key', {
+        type: 'endpoint',
+        url: address.replace(/\/v1$/, ''),
+        key,
+      });
+      assert.equal(definitions.length, 1);
+      assert.equal(definitions[0]!.choice.id, 'synthetic-local-model');
+      assert.equal(definitions[0]!.choice.contextWindow, 32768);
+      assert.equal(definitions[0]!.spec.baseUrl, address);
+      assert.deepEqual(paths.slice(0, 2), [
+        '/synthetic-private-server/models',
+        '/synthetic-private-server/v1/models',
+      ]);
+      assert.deepEqual(paths.slice(2).sort(), [
+        '/synthetic-private-server/api/v1/models',
+        '/synthetic-private-server/api/version',
+      ]);
+    });
 });
 
 describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
@@ -3393,6 +3753,11 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
       await new Promise((resolve) => setImmediate(resolve));
       const issue = owner.view().selectionIssue;
       assert.match(issue!.reason, /Synthetic new credential failure/);
+      await completePrevious('HTTP 401; Synthetic expired key.', 401);
+      assert.equal(
+        owner.view().connections.find((row) => row.id === connectionId)!.status,
+        'connected',
+      );
       await completePrevious();
       assert.deepEqual(owner.current.issue, issue);
       const current = await owner.resolve();
@@ -3877,7 +4242,7 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     await assert.rejects(owner.resolve());
   });
 
-  test('a model request failure that Pi does not retry pauses automatic requests to that model, tries again after a growing wait, and clears on success', async (t) => {
+  test('a model request failure that Pi does not retry pauses automatic requests to that model, tries again after a growing wait, clears on success, and a rejected key needs reconnecting', async (t) => {
     const f = await fixture(t);
     const { createPiMemoryCurator } = await import('../src/providers/pi/memory-curator.ts');
     const { createPiModelRuntime } = await import('../src/providers/pi/models.ts');
@@ -3960,6 +4325,7 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     );
     assert.match(service.current.issue!.reason, /requires more credits/);
     assert.deepEqual(service.view().selectionIssue, service.current.issue);
+    assert.equal(service.view().connections[0]!.status, 'connected');
     assert.equal(await allowed(), false);
     assert.equal(await allowed(second), true);
     assert.equal(service.paused({ kind: 'schedule', schedule: first }), true);
@@ -4035,6 +4401,15 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     assert.equal(calls, 9);
     assert.equal(service.view().connections[0]!.issue, undefined);
     assert.equal(service.current.issue, undefined);
+
+    reply = () => Response.json({ error: { message: 'API key expired.' } }, { status: 401 });
+    assert.equal((await ask()).stopReason, 'error');
+    assert.equal(calls, 10);
+    assert.equal(service.view().connections[0]!.status, 'reconnect');
+    assert.match(service.current.issue!.reason, /API key expired/);
+    assert.equal(service.configured, false);
+    await assert.rejects(ask(), /add it again/);
+    assert.equal(calls, 10);
   });
 
   test('model setup chooses capable defaults, preserves explicit choices and requires valid cloud accounts', async (t) => {

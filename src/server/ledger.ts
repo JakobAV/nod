@@ -602,13 +602,6 @@ export function createLedger({
       get configured() {
         return base.configured;
       },
-      ...(base.select
-        ? {
-            async select(signal?: AbortSignal) {
-              return curator(await base.select!(signal));
-            },
-          }
-        : {}),
       curate: async (request, signal, report) => {
         if (await limitReached()) throw new Error(spendingLimitReached);
         request = {
@@ -626,7 +619,8 @@ export function createLedger({
                   ? 'task_classification'
                   : request.task === 'vision' ||
                       request.task === 'attention' ||
-                      request.task === 'check'
+                      request.task === 'check' ||
+                      request.task === 'activity'
                     ? 'agent'
                     : request.task === 'review' || request.task === 'access'
                       ? 'review'

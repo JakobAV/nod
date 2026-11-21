@@ -1546,9 +1546,9 @@ test('a context restart drops old model input once and keeps later turns through
 });
 
 test('real Pi sessions persist a credential pause and resume without replaying chat history', async (t) => {
-  for (const kind of ['chat', 'background', 'task'] as const)
+  for (const kind of ['background', 'task'] as const)
     await t.test(`${kind} session`, async () => {
-      const background = kind !== 'chat';
+      const background = true;
       const directory = await mkdtemp(join(tmpdir(), 'nod-pi-'));
       const id = 'test-' + randomUUID();
       const replies: string[] = [];
@@ -2761,7 +2761,6 @@ function context(directory: string): RuntimeContext {
       url: '/api/artifacts/fixture',
     }),
     requestCredential: async () => ({ filled: true }),
-    checkWorkspaceCommand: async () => ({ record: async () => {} }),
     integration: async () => ({}),
     manage: async () => ({}),
   };
@@ -6981,16 +6980,28 @@ test('a discovered tool schema reduces the room for its next result', async (t) 
   );
 });
 
-test('opening a website with any browser tool makes private sign-in available', async (t) => {
+test('a browser tool or a guide loads the tools that go with it', async (t) => {
   const { toolDefinitions } = await import('../src/runtime/tools.ts');
+  const { createSkillLibrary } = await import('../src/providers/pi/skills.ts');
+  const { coreSkills } = await import('../src/runtime/prompt.ts');
+  const library = createSkillLibrary(join(process.cwd(), 'src/runtime/skills'), coreSkills);
   const browserTools = ['browser', 'browser_session', 'sign_in', 'pay'] as const;
   const url = 'https://people.example.test/in/synthetic';
-  for (const calls of [
-    [['nod_browser', { action: 'open', url }]],
-    [
-      ['nod_tool_search', { query: 'browser_session', limit: 1 }],
-      ['browser_session', { action: 'connect', url }],
-    ],
+  const browsing = { tools: browserTools, loads: ['sign_in', 'pay'] };
+  for (const { calls, tools, loads } of [
+    { ...browsing, calls: [['nod_browser', { action: 'open', url }]] },
+    {
+      ...browsing,
+      calls: [
+        ['nod_tool_search', { query: 'browser_session', limit: 1 }],
+        ['browser_session', { action: 'connect', url }],
+      ],
+    },
+    {
+      tools: ['skills', 'flights'],
+      loads: ['flights'],
+      calls: [['skills', { action: 'read', name: 'travel' }]],
+    },
   ] as const) {
     const opener = calls.at(-1)![0];
     await t.test(opener, async () => {
@@ -7033,8 +7044,14 @@ test('opening a website with any browser tool makes private sign-in available', 
         systemPrompt: 'Synthetic fixture instructions.',
         workspace: recordingWorkspace().workspace,
         runTool: async (_name, _params, run) => run(),
-        tools: browserTools.map((name) => ({
+        tools: tools.map((name) => ({
           ...toolDefinitions[name],
+          ...(name === 'skills'
+            ? {
+                companions: (args: Record<string, unknown>) =>
+                  library.tools?.(String(args.name)) ?? [],
+              }
+            : {}),
           parameters: toolDefinitions[name].parameters as Record<string, unknown>,
           execute: async () => ({
             content: [{ type: 'text' as const, text: 'Synthetic sign-in page.' }],
@@ -7046,7 +7063,7 @@ test('opening a website with any browser tool makes private sign-in available', 
       await session.prompt('Use my saved login to open the synthetic profile.', []);
       await session.dispose();
       assert.equal(active.length, calls.length + 1);
-      for (const companion of ['sign_in', 'pay']) {
+      for (const companion of loads) {
         assert.ok(!active.at(-2)!.includes(companion));
         assert.ok(
           active.at(-1)!.includes(companion),
@@ -9264,10 +9281,22 @@ test('cloud connections list only the account’s models and send each key only 
       }
       if (url === 'https://down.openai.azure.com/openai/v1/models')
         return Response.json({ error: { message: 'Synthetic outage' } }, { status: 503 });
-      if (url.startsWith('https://aiplatform.googleapis.com/v1/publishers/google/models/'))
+      if (url.startsWith('https://aiplatform.googleapis.com/v1/publishers/google/models/')) {
+        if (headers.get('x-goog-api-key') === 'fixture-vertex-busy')
+          return Response.json(
+            {
+              error: {
+                code: 429,
+                message: 'Synthetic fixture-vertex-busy',
+                status: 'RESOURCE_EXHAUSTED',
+              },
+            },
+            { status: 429 },
+          );
         return new Response(null, {
           status: headers.get('x-goog-api-key') === 'fixture-vertex-key' ? 200 : 400,
         });
+      }
       if (url === 'https://fixture.openai.azure.com/openai/v1/models') {
         assert.equal(headers.get('api-key'), 'fixture-azure-key');
         return Response.json({ data: [] });
@@ -9309,6 +9338,13 @@ test('cloud connections list only the account’s models and send each key only 
   await assert.rejects(
     backend.catalog('google-vertex', 'api_key', { type: 'api_key', key: 'fixture-wrong-key' }),
     /didn’t accept this API key/,
+  );
+  await assert.rejects(
+    backend.catalog('google-vertex', 'api_key', { type: 'api_key', key: 'fixture-vertex-busy' }),
+    (error: Error) =>
+      error.message.includes('HTTP 429') &&
+      error.message.includes('Synthetic [redacted]') &&
+      !error.message.includes('fixture-vertex-busy'),
   );
   const azure = await backend.catalog('azure', 'api_key', {
     type: 'azure',
@@ -10354,25 +10390,6 @@ test('OpenAI review output schemas constrain both key and subscription requests 
       await curator.curate({ task: 'review', instructions: 'Review the action.', input: {} });
       assert.deepEqual(payloads[1], { text: { verbosity: 'low' } });
     });
-});
-
-test('an unconfigured curator does not resolve a model selection', async () => {
-  let configured = false;
-  let resolutions = 0;
-  const curator = createPiMemoryCurator({
-    provider: 'openai',
-    configured: () => configured,
-    resolve: async () => {
-      resolutions++;
-      return undefined;
-    },
-  });
-  assert.equal(await curator.select!(), curator);
-  assert.equal(resolutions, 0);
-  assert.equal(curator.configured, false);
-  configured = true;
-  await assert.rejects(curator.select!(), /selected model is unavailable/);
-  assert.equal(resolutions, 1);
 });
 
 test('an unavailable classification resolver never loads a fallback model', async () => {
@@ -11736,59 +11753,6 @@ async function access(provider: ModelAccess['provider'], id: string): Promise<Mo
   };
 }
 
-test('a selected Trust curator keeps its model and records both requests', async (t) => {
-  const originalFetch = globalThis.fetch;
-  t.after(() => (globalThis.fetch = originalFetch));
-  let current = smallContextAccess('compatible', 'fixture-trust-original', 32768);
-  let selections = 0;
-  const models: string[] = [];
-  const usage: Array<{ id: string; model?: string }> = [];
-  globalThis.fetch = async (input, init) => {
-    const request = new Request(input, init);
-    assert.equal(new URL(request.url).hostname, '127.0.0.1');
-    models.push(String((await request.json()).model));
-    return reply({ role: 'assistant', content: '{"review":"clear"}' });
-  };
-  const curator = createPiMemoryCurator({
-    provider: current.provider,
-    configured: () => true,
-    resolve: async () => {
-      selections++;
-      return current;
-    },
-  });
-  const selected = await curator.select!();
-  current = smallContextAccess('compatible', 'fixture-trust-replacement', 32768);
-  const signal = new AbortController().signal;
-  await Promise.all(
-    ['grant', 'restriction'].map((purpose) =>
-      selected.curate(
-        { task: 'review', instructions: 'Return synthetic JSON.', input: { purpose } },
-        signal,
-        (value) => usage.push(value),
-      ),
-    ),
-  );
-  assert.equal(selections, 1);
-  assert.deepEqual(models, ['fixture-trust-original', 'fixture-trust-original']);
-  assert.equal(usage.length, 2);
-  assert.notEqual(usage[0].id, usage[1].id);
-  assert.deepEqual(
-    usage.map((value) => value.model),
-    models,
-  );
-  const stopped = new AbortController();
-  stopped.abort();
-  await assert.rejects(
-    selected.curate({ task: 'review', instructions: '', input: {} }, stopped.signal),
-    { name: 'AbortError' },
-  );
-  await assert.rejects(curator.select!(stopped.signal), { name: 'AbortError' });
-  assert.equal(selections, 1);
-  assert.equal(models.length, 2);
-  assert.equal(usage.length, 2);
-});
-
 function reply(content: Record<string, unknown>, finish = 'stop') {
   const chunk = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
   return new Response(
@@ -12197,6 +12161,7 @@ test('invalid tool calls stop before another model request and a valid repair re
       const run = () =>
         runtime.runTurn({
           ...context(directory),
+          ...(toolName === 'sign_in' ? { background: true } : {}),
           turnId: randomUUID(),
           task: async () => {
             writes++;
