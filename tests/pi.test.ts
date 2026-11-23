@@ -188,9 +188,9 @@ test('models and routers complete tool discovery inside the endpoint context', a
       const calls =
         id === 'fixture-docs-small'
           ? ([
-              ['nod_tool_search', { query: 'nod_docs', limit: 1 }],
-              ['nod_docs', { action: 'search', query: 'Composio zero data retention' }],
-              ['nod_docs', { action: 'read', id: docsSection!.id }],
+              ['nod_tool_search', { query: 'nod', limit: 1 }],
+              ['nod', { action: 'docs_search', args: { query: 'Composio zero data retention' } }],
+              ['nod', { action: 'docs_read', args: { id: docsSection!.id } }],
               ['nod_tool_search', { query: 'share_file', limit: 1 }],
               ['share_file', { path: 'report.txt' }],
             ] as const)
@@ -450,7 +450,7 @@ test('models and routers complete tool discovery inside the endpoint context', a
       assert.deepEqual(
         started,
         id === 'fixture-docs-small'
-          ? ['tool_search', 'nod_docs', 'nod_docs', 'tool_search', 'share_file']
+          ? ['tool_search', 'nod', 'nod', 'tool_search', 'share_file']
           : id === 'fixture-background'
             ? ['tool_search', 'skills', 'send_message']
             : ['tool_search', 'skills', 'tool_search', 'share_file'],
@@ -1629,7 +1629,7 @@ test('real Pi sessions persist a credential pause and resume without replaying c
                     {
                       type: 'toolCall',
                       id: 'later-call',
-                      name: 'manage_personal_context',
+                      name: 'nod',
                       arguments: {
                         action: 'schedule_create',
                         args: { title: 'This should not execute' },
@@ -2015,7 +2015,7 @@ test('fresh scheduled sessions put their stable first request on a one-hour Anth
   );
   assert.equal(stable[0].length, 2);
   assert.match(stable[0][0].text, /^Owner context/);
-  assert.match(stable[0][1].text, /^Respond to currentInstruction/);
+  assert.match(stable[0][1].text, /^Request data \(JSON\)/);
   assert.deepEqual(
     stable[0].map((block: any) => block.text),
     stable[1].map((block: any) => block.text),
@@ -2294,9 +2294,9 @@ test('Pi sessions use native tools on the sandbox workspace plus Nod tools', asy
     });
     assert.equal(captured!.noTools, 'builtin');
     const before = scripts.length;
-    const ls = captured!.customTools!.find((tool) => tool.name === 'ls')!;
-    await ls.execute('call', {}, undefined, undefined, undefined as never);
-    assert.deepEqual(ran, ['ls']);
+    const bash = captured!.customTools!.find((tool) => tool.name === 'bash')!;
+    await bash.execute('call', { command: 'true' }, undefined, undefined, undefined as never);
+    assert.deepEqual(ran, ['bash']);
     assert.ok(scripts.length > before);
     assert.ok(scripts.slice(before).every((script) => script.includes(workspace.path)));
     const extension = captured!
@@ -2310,7 +2310,7 @@ test('Pi sessions use native tools on the sandbox workspace plus Nod tools', asy
       undefined,
       undefined as never,
     );
-    assert.deepEqual(ran, ['ls', 'get_search_content']);
+    assert.deepEqual(ran, ['bash', 'get_search_content']);
     const webSearch = extension.tools.get('web_search')!;
     await webSearch.definition.execute(
       'call',
@@ -2319,7 +2319,7 @@ test('Pi sessions use native tools on the sandbox workspace plus Nod tools', asy
       undefined,
       undefined as never,
     );
-    assert.deepEqual(ran, ['ls', 'get_search_content', 'web_search']);
+    assert.deepEqual(ran, ['bash', 'get_search_content', 'web_search']);
     const fetchContent = extension.tools.get('fetch_content')!;
     await writeFile(join(directory, 'host.mp4'), 'synthetic host video');
     const hostFile = async (name: string) =>
@@ -2577,12 +2577,9 @@ test('native Pi tools run only through workspace exec on sandbox paths that do n
   assert.equal(await run('read', { path: 'notes/a.txt' }), 'alpha\nbeta\n');
   await run('edit', { path: 'notes/a.txt', edits: [{ oldText: 'beta', newText: 'gamma' }] });
   assert.equal(await run('read', { path: `${prefix}/workspace/notes/a.txt` }), 'alpha\ngamma\n');
-  assert.equal(await run('ls', {}), 'notes/');
-  assert.equal(await run('ls', { path: 'notes' }), 'a.txt');
-  assert.equal(await run('find', { pattern: '*.txt' }), 'notes/a.txt');
   assert.equal((await run('bash', { command: 'pwd' })).trim(), `${prefix}/workspace`);
   await assert.rejects(run('read', { path: 'missing.txt' }));
-  assert.ok(calls.length >= 8);
+  assert.ok(calls.length >= 5);
   assert.equal(existsSync(prefix), false);
 });
 
@@ -2611,9 +2608,6 @@ test('native Pi tools use Linux workspace paths on a Windows host', async (t) =>
     await execute('read', { path: `${prefix}/workspace/notes/a.txt` }),
     'alpha\ngamma\n',
   );
-  assert.equal(await execute('ls', {}), 'notes/');
-  assert.equal(await execute('ls', { path: 'notes' }), 'a.txt');
-  assert.equal(await execute('find', { pattern: '*.txt' }), 'notes/a.txt');
   assert.equal((await execute('bash', { command: 'pwd' })).trim(), `${prefix}/workspace`);
   assert.deepEqual(
     calls.filter((command) => command.includes('C:') || command.includes('\\workspace')),
@@ -2791,7 +2785,7 @@ test('a turn posts its opening line and final reply, shows the lines between as 
                 .execute({ text: 'There are three.' });
             else
               await input.tools
-                .find((item) => item.name === 'manage_personal_context')!
+                .find((item) => item.name === 'memory')!
                 .execute({ action: 'memory_find', args: { query: 'synthetic' } });
             continued.push(...((await input.nextMessages?.()) ?? []).map((item) => item.text));
           }
@@ -4488,8 +4482,14 @@ test('each model call yields one chat-format trace without image data', async ()
               {
                 type: 'toolCall',
                 id: 'memory',
-                name: 'manage_personal_context',
+                name: 'memory',
                 arguments: { action: 'memory_read', path: 'about/sizes' },
+              },
+              {
+                type: 'toolCall',
+                id: 'legacy-memory',
+                name: 'manage_personal_context',
+                arguments: { action: 'memory_find', query: 'synthetic legacy query' },
               },
               {
                 type: 'toolCall',
@@ -4511,7 +4511,8 @@ test('each model call yields one chat-format trace without image data', async ()
               },
             ],
           },
-          result('memory', 'manage_personal_context', 'Synthetic saved note'),
+          result('memory', 'memory', 'Synthetic saved note'),
+          result('legacy-memory', 'manage_personal_context', 'Synthetic legacy note'),
           result('learned', 'skills', untrustedBlock('learned skill', 'Synthetic learned flow')),
           result('guide', 'skills', 'Synthetic built-in guide'),
           result('code', 'codemode', 'Synthetic codemode note'),
@@ -4523,6 +4524,8 @@ test('each model call yields one chat-format trace without image data', async ()
   const sent = JSON.stringify(reads.messages);
   for (const value of [
     'Synthetic saved note',
+    'Synthetic legacy note',
+    'synthetic legacy query',
     'Synthetic learned flow',
     'about/sizes',
     'synthetic-flow',
@@ -4573,8 +4576,8 @@ test('each model call yields one chat-format trace without image data', async ()
       ],
     },
   };
+  assert.ok(firstInstruction(selectedContext, false, new Set()).includes(privateFact));
   for (const owned of [ownerContext(selectedContext), compactOwnerContext(selectedContext)]) {
-    assert.ok(owned.includes(privateFact));
     const selectedTrace = piModelTrace(
       {
         ...calls[0],
@@ -5973,7 +5976,11 @@ test('loaded tools stay available across turns until they are removed', async (t
               {
                 name: 'synthetic_lookup',
                 description: 'Look up the synthetic record.',
-                deferred: { namespace: 'synthetic', description: 'Synthetic tools.' },
+                deferred: {
+                  namespace: 'synthetic',
+                  description: 'Synthetic tools.',
+                  guide: 'Synthetic server guide.',
+                },
                 parameters: Type.Object({}),
                 execute: async () => {
                   lookups++;
@@ -5994,6 +6001,8 @@ test('loaded tools stay available across turns until they are removed', async (t
   assert.ok(declared(bodies[3]!).includes('synthetic_lookup'));
   assert.ok(!declared(bodies[4]!).includes('synthetic_lookup'));
   assert.ok(JSON.stringify(bodies[4]!.messages).includes('synthetic_lookup'));
+  assert.ok(!JSON.stringify(bodies[0]!.messages).includes('Synthetic server guide.'));
+  assert.equal(JSON.stringify(bodies[4]!.messages).split('Synthetic server guide.').length, 2);
 });
 
 test('a failed request cannot remain inside a compaction checkpoint', async (t) => {
@@ -8878,7 +8887,8 @@ test('native provider discovery uses owned keys, bounded Google pagination and t
   await assert.rejects(
     backend.catalog('google', 'api_key', { type: 'api_key', key: 'fixture-rejected-key' }),
     (error: Error) =>
-      /didn’t accept/.test(error.message) && !error.message.includes('fixture-rejected-key'),
+      /Google Gemini model discovery failed.*HTTP 400/.test(error.message) &&
+      !/didn’t accept|fixture-rejected-key/.test(error.message),
   );
   assert.equal(new URL(calls[1]).searchParams.get('private'), null);
   const before = calls.length;
@@ -8900,6 +8910,63 @@ test('native provider discovery uses owned keys, bounded Google pagination and t
     repeating.catalog('google', 'api_key', { type: 'api_key', key: 'fixture-google-key' }),
   );
   assert.equal(pages, 2);
+});
+
+test('model discovery names why it failed instead of a generic retry message', async () => {
+  const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
+  const refused = () =>
+    Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:8080'), {
+        code: 'ECONNREFUSED',
+      }),
+    });
+  const native = (fetch: typeof globalThis.fetch) =>
+    createPiModelBackend({ fetch }).catalog('xai', 'api_key', {
+      type: 'api_key',
+      key: 'fixture-xai-key',
+    });
+  await assert.rejects(
+    native(async () => {
+      throw new DOMException('The operation timed out.', 'TimeoutError');
+    }),
+    /xAI couldn’t load its models: the request timed out\./,
+  );
+  await assert.rejects(
+    native(async () => {
+      throw refused();
+    }),
+    /xAI couldn’t load its models: the connection failed \(ECONNREFUSED\)\./,
+  );
+  await assert.rejects(
+    native(async () => {
+      throw new TypeError('fetch failed', {
+        cause: new Error('Synthetic name lookup failed. fixture-xai-key'),
+      });
+    }),
+    (error: Error) =>
+      /Synthetic name lookup failed/.test(error.message) &&
+      !error.message.includes('fixture-xai-key'),
+  );
+  await assert.rejects(
+    native(async () => new Response('<html>challenge</html>', { status: 200 })),
+    /xAI couldn’t load its models: it returned an invalid model list\./,
+  );
+  await assert.rejects(
+    native(async () => Response.json({ models: [] })),
+    /xAI couldn’t load its models: it returned an invalid model list\./,
+  );
+  await assert.rejects(
+    native(async () =>
+      Response.json(
+        { error: { message: 'Access is restricted to a private network. fixture-xai-key' } },
+        { status: 403 },
+      ),
+    ),
+    (error: Error) =>
+      /xAI model discovery failed.*HTTP 403.*Access is restricted to a private network/s.test(
+        error.message,
+      ) && !/didn’t accept|fixture-xai-key/.test(error.message),
+  );
 });
 
 test('native account catalogs never send a provider key to a different service or accept a failed listing', async () => {
@@ -9257,6 +9324,13 @@ test('cloud connections list only the account’s models and send each key only 
       requests.push(url);
       assert.equal(init?.redirect, 'error');
       if (url.startsWith('https://bedrock.eu-west-1.amazonaws.com/')) {
+        if (headers.get('authorization') === 'Bearer fixture-bedrock-expired')
+          return Response.json(
+            { message: 'The security token fixture-bedrock-expired is expired' },
+            { status: 403 },
+          );
+        if (headers.get('authorization') === 'Bearer fixture-bedrock-malformed')
+          return Response.json({ message: 'Malformed input request' }, { status: 400 });
         if (headers.get('authorization') !== 'Bearer fixture-bedrock-key')
           return Response.json({ message: 'Synthetic denial' }, { status: 403 });
         if (url.includes('/foundation-models?'))
@@ -9281,6 +9355,13 @@ test('cloud connections list only the account’s models and send each key only 
       }
       if (url === 'https://down.openai.azure.com/openai/v1/models')
         return Response.json({ error: { message: 'Synthetic outage' } }, { status: 503 });
+      if (url === 'https://private.openai.azure.com/openai/v1/models')
+        return Response.json(
+          { error: { code: '403', message: 'Public access is disabled.' } },
+          { status: 403 },
+        );
+      if (url === 'https://gone.openai.azure.com/openai/v1/models')
+        return Response.json({ error: { message: 'Resource not found' } }, { status: 404 });
       if (url.startsWith('https://aiplatform.googleapis.com/v1/publishers/google/models/')) {
         if (headers.get('x-goog-api-key') === 'fixture-vertex-busy')
           return Response.json(
@@ -9292,6 +9373,17 @@ test('cloud connections list only the account’s models and send each key only 
               },
             },
             { status: 429 },
+          );
+        if (headers.get('x-goog-api-key') === 'fixture-vertex-disabled')
+          return Response.json(
+            {
+              error: {
+                code: 403,
+                message: 'Vertex AI API is disabled.',
+                status: 'PERMISSION_DENIED',
+              },
+            },
+            { status: 403 },
           );
         return new Response(null, {
           status: headers.get('x-goog-api-key') === 'fixture-vertex-key' ? 200 : 400,
@@ -9319,7 +9411,21 @@ test('cloud connections list only the account’s models and send each key only 
       key: 'fixture-wrong-key',
       region: 'eu-west-1',
     }),
-    /didn’t accept this key/,
+    /Amazon Bedrock model discovery failed \(HTTP 403\).*Synthetic denial/,
+  );
+  const bedrockFailure = (key: string) =>
+    backend.catalog('amazon-bedrock', 'api_key', { type: 'bedrock', key, region: 'eu-west-1' });
+  await assert.rejects(
+    bedrockFailure('fixture-bedrock-expired'),
+    (error: Error) =>
+      /Amazon Bedrock model discovery failed \(HTTP 403\).*security token \[redacted\] is expired/.test(
+        error.message,
+      ) && !error.message.includes('fixture-bedrock-expired'),
+  );
+  await assert.rejects(bedrockFailure('fixture-bedrock-malformed'), (error: Error) =>
+    /Amazon Bedrock model discovery failed \(HTTP 400\).*Malformed input request/.test(
+      error.message,
+    ),
   );
   const sent = requests.length;
   await assert.rejects(
@@ -9337,7 +9443,14 @@ test('cloud connections list only the account’s models and send each key only 
   assert.ok(vertex.length > 1);
   await assert.rejects(
     backend.catalog('google-vertex', 'api_key', { type: 'api_key', key: 'fixture-wrong-key' }),
-    /didn’t accept this API key/,
+    /Google Vertex AI model discovery failed \(HTTP 400\)/,
+  );
+  await assert.rejects(
+    backend.catalog('google-vertex', 'api_key', {
+      type: 'api_key',
+      key: 'fixture-vertex-disabled',
+    }),
+    /Google Vertex AI model discovery failed \(HTTP 403\).*Vertex AI API is disabled/,
   );
   await assert.rejects(
     backend.catalog('google-vertex', 'api_key', { type: 'api_key', key: 'fixture-vertex-busy' }),
@@ -9357,6 +9470,20 @@ test('cloud connections list only the account’s models and send each key only 
     azure.map(({ choice }) => choice.id),
     ['gpt-6.1-sol'],
   );
+  for (const [host, pattern] of [
+    ['private', /Azure OpenAI model discovery failed \(HTTP 403\).*Public access is disabled/],
+    ['gone', /Azure OpenAI model discovery failed \(HTTP 404\).*Resource not found/],
+  ] as const)
+    await assert.rejects(
+      backend.catalog('azure', 'api_key', {
+        type: 'azure',
+        url: `https://${host}.openai.azure.com/openai/v1`,
+        key: 'fixture-azure-key',
+        model: 'gpt-6.1-sol',
+        deployment: 'fixture-deployment',
+      }),
+      (error: Error) => pattern.test(error.message) && !error.message.includes('didn’t accept'),
+    );
   await assert.rejects(
     backend.catalog('azure', 'api_key', {
       type: 'azure',
@@ -11552,7 +11679,9 @@ test('Anthropic workspace discovery offers named choices and separates retryable
     ...[400, 401, 403, 404].map((status) => ({
       name: `discovery status ${status}`,
       manual: true,
-      response: () => Response.json({ error: { message: key } }, { status }),
+      status,
+      response: () =>
+        Response.json({ error: { message: `Synthetic workspace denial ${key}` } }, { status }),
     })),
     ...[429, 500, 503].map((status) => ({
       name: `discovery status ${status}`,
@@ -11596,11 +11725,12 @@ test('Anthropic workspace discovery offers named choices and separates retryable
             assert.ok(!(error instanceof ModelWorkspaceSelectionError));
           } else {
             assert.ok(!(error instanceof ModelAuthError));
-            assert.ok(error.cause instanceof Error);
-            if (scenario.status) {
-              assert.ok(error.cause.message.includes(String(scenario.status)));
-              assert.ok(!error.message.includes(String(scenario.status)));
-            }
+            if (scenario.status) assert.ok(error.message.includes(`HTTP ${scenario.status}`));
+            else assert.ok(error.cause instanceof Error);
+          }
+          if (scenario.status) {
+            assert.ok(error.message.includes(`HTTP ${scenario.status}`));
+            if (scenario.manual) assert.match(error.message, /Synthetic workspace denial/);
           }
           assert.ok(!error.message.includes(key));
           assert.ok(!JSON.stringify(error).includes(key));
