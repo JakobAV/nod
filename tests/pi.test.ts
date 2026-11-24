@@ -1,5 +1,5 @@
 import { lightestEffort, type ModelSelection } from '../src/shared/models.ts';
-import type { Context } from '@earendil-works/pi-ai';
+import type { Context, UserMessage } from '@earendil-works/pi-ai';
 import type { ModelAccess } from '../src/ports/models.ts';
 import { createPiModelBackend, createPiModelRuntime } from '../src/providers/pi/models.ts';
 import type { Presentation } from '../src/shared/presentation.ts';
@@ -1276,97 +1276,107 @@ test(
   },
 );
 
-test('a Codemode deadline ends the wait with an unknown tool outcome', async (t) => {
-  const { executeCodemode } = await import(
-    new URL(
-      '../node_modules/@earendil-works/pi-coding-agent/dist/extensions/codemode/execute.js',
-      import.meta.url,
-    ).href
-  );
-  for (const mode of ['timeout', 'failure', 'unawaited'] as const)
-    for (const late of ['resolve', 'reject'] as const)
-      await t.test(`${mode} then ${late}`, { timeout: 5_000 }, async () => {
-        let entered!: () => void;
-        const started = new Promise<void>((resolve) => (entered = resolve));
-        let reject!: (error: Error) => void;
-        let release!: () => void;
-        const held = new Promise<void>((resolve, refuse) => {
-          release = resolve;
-          reject = refuse;
+test(
+  'a Codemode deadline ends the wait with an unknown tool outcome',
+  { concurrency: 2 },
+  async (t) => {
+    const { executeCodemode } = await import(
+      new URL(
+        '../node_modules/@earendil-works/pi-coding-agent/dist/extensions/codemode/execute.js',
+        import.meta.url,
+      ).href
+    );
+    const cases: Promise<void>[] = [];
+    for (const mode of ['timeout', 'failure', 'unawaited'] as const)
+      for (const late of ['resolve', 'reject'] as const) {
+        const subtest = t.test(`${mode} then ${late}`, { timeout: 20_000 }, async () => {
+          let entered!: () => void;
+          const started = new Promise<void>((resolve) => (entered = resolve));
+          let reject!: (error: Error) => void;
+          let release!: () => void;
+          const held = new Promise<void>((resolve, refuse) => {
+            release = resolve;
+            reject = refuse;
+          });
+          const stop = new AbortController();
+          const calls: string[] = [];
+          let commits = 0;
+          const code =
+            '// @options: {"timeout_ms": 750}\n' +
+            (mode === 'timeout'
+              ? 'await tools.synthetic_wait({});'
+              : mode === 'failure'
+                ? 'await Promise.all([tools.synthetic_fail({}),tools.synthetic_wait({})]);'
+                : 'void tools.synthetic_wait({}); await tools.synthetic_barrier({}); text("Local script finished.");');
+          const pending = executeCodemode('synthetic-deadline', { code }, stop.signal, undefined, {
+            tools: ['synthetic_fail', 'synthetic_wait', 'synthetic_barrier'].map((name) => ({
+              name,
+              label: name,
+              description: 'Synthetic tool.',
+              parameters: Type.Object({}),
+              execute: async () => ({ content: [], details: {} }),
+            })),
+            sessionManager: SessionManager.inMemory(process.cwd()),
+            executeTool: async (name: string) => {
+              calls.push(name);
+              if (name === 'synthetic_wait') {
+                entered();
+                await held;
+                commits++;
+              }
+              await started;
+              return {
+                toolCall: { type: 'toolCall', id: name, name, arguments: {} },
+                result: { content: [{ type: 'text', text: 'Synthetic result.' }], details: {} },
+                isError: name === 'synthetic_fail',
+              };
+            },
+          });
+          let deadline: ReturnType<typeof globalThis.setTimeout> | undefined;
+          try {
+            const result = await Promise.race([
+              pending,
+              new Promise<never>((_resolve, fail) => {
+                deadline = globalThis.setTimeout(
+                  () => fail(new Error('The script exceeded its deadline.')),
+                  5_000,
+                );
+              }),
+            ]);
+            assert.equal(stop.signal.aborted, false);
+            const text = result.content
+              .map((part: { text?: string }) => part.text ?? '')
+              .join('\n');
+            assert.match(text, /outcome unknown|results are still unknown/i);
+            assert.doesNotMatch(text, /synthetic_wait \((?:cancelled|ok)\)/);
+            const snapshot = JSON.stringify(result.details);
+            assert.equal(
+              result.details.calls.find((call: { name: string }) => call.name === 'synthetic_wait')
+                .status,
+              'running',
+            );
+            assert.equal(result.isError === true, mode !== 'unawaited');
+            if (mode === 'timeout') assert.match(text, /timed out/);
+            if (mode === 'unawaited') assert.match(text, /Local script finished/);
+            assert.equal(commits, 0);
+            if (late === 'resolve') release();
+            else reject(new Error('Synthetic tool rejected after the deadline.'));
+            await setTimeout(25);
+            assert.equal(JSON.stringify(result.details), snapshot);
+            assert.equal(commits, Number(late === 'resolve'));
+            assert.equal(calls.filter((name) => name === 'synthetic_wait').length, 1);
+          } finally {
+            if (deadline) globalThis.clearTimeout(deadline);
+            stop.abort();
+            reject(new Error('Synthetic deadline cleanup.'));
+            await pending;
+          }
         });
-        const stop = new AbortController();
-        const calls: string[] = [];
-        let commits = 0;
-        const code =
-          '// @options: {"timeout_ms": 250}\n' +
-          (mode === 'timeout'
-            ? 'await tools.synthetic_wait({});'
-            : mode === 'failure'
-              ? 'await Promise.all([tools.synthetic_fail({}),tools.synthetic_wait({})]);'
-              : 'void tools.synthetic_wait({}); await tools.synthetic_barrier({}); text("Local script finished.");');
-        const pending = executeCodemode('synthetic-deadline', { code }, stop.signal, undefined, {
-          tools: ['synthetic_fail', 'synthetic_wait', 'synthetic_barrier'].map((name) => ({
-            name,
-            label: name,
-            description: 'Synthetic tool.',
-            parameters: Type.Object({}),
-            execute: async () => ({ content: [], details: {} }),
-          })),
-          sessionManager: SessionManager.inMemory(process.cwd()),
-          executeTool: async (name: string) => {
-            calls.push(name);
-            if (name === 'synthetic_wait') {
-              entered();
-              await held;
-              commits++;
-            }
-            await started;
-            return {
-              toolCall: { type: 'toolCall', id: name, name, arguments: {} },
-              result: { content: [{ type: 'text', text: 'Synthetic result.' }], details: {} },
-              isError: name === 'synthetic_fail',
-            };
-          },
-        });
-        let deadline: ReturnType<typeof globalThis.setTimeout> | undefined;
-        try {
-          const result = await Promise.race([
-            pending,
-            new Promise<never>((_resolve, fail) => {
-              deadline = globalThis.setTimeout(
-                () => fail(new Error('The script exceeded its deadline.')),
-                1_000,
-              );
-            }),
-          ]);
-          assert.equal(stop.signal.aborted, false);
-          const text = result.content.map((part: { text?: string }) => part.text ?? '').join('\n');
-          assert.match(text, /outcome unknown|results are still unknown/i);
-          assert.doesNotMatch(text, /synthetic_wait \((?:cancelled|ok)\)/);
-          const snapshot = JSON.stringify(result.details);
-          assert.equal(
-            result.details.calls.find((call: { name: string }) => call.name === 'synthetic_wait')
-              .status,
-            'running',
-          );
-          assert.equal(result.isError === true, mode !== 'unawaited');
-          if (mode === 'timeout') assert.match(text, /timed out/);
-          if (mode === 'unawaited') assert.match(text, /Local script finished/);
-          assert.equal(commits, 0);
-          if (late === 'resolve') release();
-          else reject(new Error('Synthetic tool rejected after the deadline.'));
-          await setTimeout(25);
-          assert.equal(JSON.stringify(result.details), snapshot);
-          assert.equal(commits, Number(late === 'resolve'));
-          assert.equal(calls.filter((name) => name === 'synthetic_wait').length, 1);
-        } finally {
-          if (deadline) globalThis.clearTimeout(deadline);
-          stop.abort();
-          reject(new Error('Synthetic deadline cleanup.'));
-          await pending;
-        }
-      });
-});
+        cases.push(subtest);
+      }
+    await Promise.all(cases);
+  },
+);
 
 test('a new Pi request follows refreshed owner context after an approval pause', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'nod-pi-approval-next-'));
@@ -2618,6 +2628,7 @@ test('native Pi tools use Linux workspace paths on a Windows host', async (t) =>
 test('bash output larger than Pi limits stays in the sandbox and never creates host temp files', async (t) => {
   const { prefix, root, tools, run } = await hostSandbox(t);
   const before = (await readdir(tmpdir())).filter((name) => name.startsWith('pi-bash-'));
+  const timedOut = assert.rejects(run('bash', { command: 'sleep 5', timeout: 1 }));
   const output = await run('bash', { command: 'seq 1 100000' });
   assert.ok(Buffer.byteLength(output) < 60 * 1024);
   assert.match(output, /100000\n/);
@@ -2642,7 +2653,7 @@ test('bash output larger than Pi limits stays in the sandbox and never creates h
   assert.equal(failed.isError, true);
   const failure = failed.content.map((part) => (part.type === 'text' ? part.text : '')).join('');
   assert.ok(Buffer.byteLength(failure) < 60 * 1024);
-  await assert.rejects(run('bash', { command: 'sleep 5', timeout: 1 }));
+  await timedOut;
   const after = (await readdir(tmpdir())).filter((name) => name.startsWith('pi-bash-'));
   assert.deepEqual(after, before);
 });
@@ -2716,7 +2727,7 @@ test('the owner command stream records exit status and output without known secr
     }
     return events.filter((event) => event.command);
   };
-  const records = await run(createCommandRedactor([secret]));
+  const [records, unredacted] = await Promise.all([run(createCommandRedactor([secret])), run()]);
   assert.deepEqual(
     records.map(({ type, command }) => [type, command?.command, command?.exitCode]),
     [
@@ -2729,7 +2740,7 @@ test('the owner command stream records exit status and output without known secr
   assert.match(records[1].command!.output!, /^\[redacted\]\npassword=\[redacted\]/);
   assert.match(records[3].command!.output!, /late-\[redacted\][\s\S]*timed out/);
   assert.equal(JSON.stringify(records).includes('synthetic-'), false);
-  assert.deepEqual(await run(), []);
+  assert.deepEqual(unredacted, []);
 });
 
 // Runtime: one active turn, stop and shutdown drain.
@@ -4825,276 +4836,287 @@ test('agent and curator traces share analytics IDs across parallel turns and sep
   await standalone.shutdown();
 });
 
-test('a long tool call does not send model requests without usage records', async (t) => {
-  for (const [outcome, changeContext] of [
-    ['failed', false],
-    ['succeeded', false],
-    ['succeeded', true],
-  ] as const)
-    await t.test(changeContext ? 'changed context' : outcome, async (t) => {
-      const { createServer } = await import('node:http');
-      const { createPiModelBackend, createPiModelRuntime } =
-        await import('../src/providers/pi/models.ts');
-      const chunk = (value: object) => `data: ${JSON.stringify(value)}\n\n`;
-      let requests = 0;
-      let realRequests = 0;
-      let tools = 0;
-      let current: Awaited<ReturnType<typeof createAgentSession>>['session'] | undefined;
-      let persistedRefreshes = 0;
-      let completeRefresh: () => void;
-      const refreshCompleted = new Promise<void>((resolve) => {
-        completeRefresh = resolve;
-      });
-      const usage: Array<{
-        id: string;
-        operation?: string;
-        status?: string;
-        costUsd?: number | null;
-      }> = [];
-      const traces: import('../src/ports/traces.ts').ModelTrace[] = [];
-      let holdRefresh = false;
-      let refreshStarted: (() => void) | undefined;
-      let releaseRefresh: (() => void) | undefined;
-      const server = createServer((request, response) => {
-        const parts: Buffer[] = [];
-        request.on('data', (part) => parts.push(part));
-        request.on('end', () => {
-          const send = (value: unknown) => {
-            response.writeHead(200, { 'content-type': 'application/json' });
-            response.end(JSON.stringify(value));
-          };
-          if (request.url === '/v1/models') return send({ data: [{ id: 'fixture-cache' }] });
-          if (request.url === '/api/version') return send({ version: '0.0.0' });
-          if (request.url === '/api/show')
-            return send({
-              capabilities: ['completion', 'tools'],
-              model_info: { 'llama.context_length': 200000 },
-            });
-          if (request.url !== '/v1/chat/completions') {
-            response.writeHead(404);
-            return response.end();
-          }
-          requests++;
-          const body = JSON.parse(Buffer.concat(parts).toString());
-          if (body.max_tokens === 1 || body.max_completion_tokens === 1) {
-            if (outcome === 'failed') {
-              response.writeHead(500, { 'content-type': 'application/json' });
-              return response.end(
-                JSON.stringify({ error: { message: 'Synthetic refresh failure' } }),
-              );
+test(
+  'a long tool call does not send model requests without usage records',
+  { concurrency: true },
+  async (t) => {
+    const cases: Promise<void>[] = [];
+    for (const [outcome, changeContext] of [
+      ['failed', false],
+      ['succeeded', false],
+      ['succeeded', true],
+    ] as const) {
+      const subtest = t.test(changeContext ? 'changed context' : outcome, async (t) => {
+        const { createServer } = await import('node:http');
+        const { createPiModelBackend, createPiModelRuntime } =
+          await import('../src/providers/pi/models.ts');
+        const chunk = (value: object) => `data: ${JSON.stringify(value)}\n\n`;
+        let requests = 0;
+        let realRequests = 0;
+        let tools = 0;
+        let current: Awaited<ReturnType<typeof createAgentSession>>['session'] | undefined;
+        let persistedRefreshes = 0;
+        let completeRefresh: () => void;
+        const refreshCompleted = new Promise<void>((resolve) => {
+          completeRefresh = resolve;
+        });
+        const usage: Array<{
+          id: string;
+          operation?: string;
+          status?: string;
+          costUsd?: number | null;
+        }> = [];
+        const traces: import('../src/ports/traces.ts').ModelTrace[] = [];
+        let holdRefresh = false;
+        let refreshStarted: (() => void) | undefined;
+        let releaseRefresh: (() => void) | undefined;
+        const server = createServer((request, response) => {
+          const parts: Buffer[] = [];
+          request.on('data', (part) => parts.push(part));
+          request.on('end', () => {
+            const send = (value: unknown) => {
+              response.writeHead(200, { 'content-type': 'application/json' });
+              response.end(JSON.stringify(value));
+            };
+            if (request.url === '/v1/models') return send({ data: [{ id: 'fixture-cache' }] });
+            if (request.url === '/api/version') return send({ version: '0.0.0' });
+            if (request.url === '/api/show')
+              return send({
+                capabilities: ['completion', 'tools'],
+                model_info: { 'llama.context_length': 200000 },
+              });
+            if (request.url !== '/v1/chat/completions') {
+              response.writeHead(404);
+              return response.end();
             }
-            const finish = () => {
-              if (changeContext && current)
-                current.agent.state.messages = current.agent.state.messages.map((message) => ({
-                  ...message,
-                }));
-              response.writeHead(200, { 'content-type': 'text/event-stream' });
-              response.end(
-                chunk({
-                  id: 'fixture-warm-' + requests,
-                  choices: [{ index: 0, delta: { role: 'assistant', content: 'x' } }],
-                }) +
+            requests++;
+            const body = JSON.parse(Buffer.concat(parts).toString());
+            if (body.max_tokens === 1 || body.max_completion_tokens === 1) {
+              if (outcome === 'failed') {
+                response.writeHead(500, { 'content-type': 'application/json' });
+                return response.end(
+                  JSON.stringify({ error: { message: 'Synthetic refresh failure' } }),
+                );
+              }
+              const finish = () => {
+                if (changeContext && current)
+                  current.agent.state.messages = current.agent.state.messages.map((message) => ({
+                    ...message,
+                  }));
+                response.writeHead(200, { 'content-type': 'text/event-stream' });
+                response.end(
                   chunk({
                     id: 'fixture-warm-' + requests,
-                    choices: [{ index: 0, delta: {}, finish_reason: 'length' }],
-                    usage: {
-                      prompt_tokens: 100000,
-                      prompt_tokens_details: { cached_tokens: 100000 },
-                      completion_tokens: 1,
-                      total_tokens: 100001,
-                    },
+                    choices: [{ index: 0, delta: { role: 'assistant', content: 'x' } }],
                   }) +
-                  'data: [DONE]\n\n',
-              );
-            };
-            if (holdRefresh) {
-              releaseRefresh = finish;
-              refreshStarted?.();
-            } else finish();
-            return;
-          }
-          const first = ++realRequests === 1;
-          response.writeHead(200, { 'content-type': 'text/event-stream' });
-          response.end(
-            chunk({
-              id: 'fixture-' + realRequests,
-              choices: [
-                {
-                  index: 0,
-                  delta: first
-                    ? {
-                        role: 'assistant',
-                        tool_calls: [
-                          {
-                            index: 0,
-                            id: 'fixture-wait',
-                            type: 'function',
-                            function: { name: 'fixture_wait', arguments: '{}' },
-                          },
-                        ],
-                      }
-                    : { role: 'assistant', content: 'Finished the synthetic wait.' },
-                },
-              ],
-            }) +
+                    chunk({
+                      id: 'fixture-warm-' + requests,
+                      choices: [{ index: 0, delta: {}, finish_reason: 'length' }],
+                      usage: {
+                        prompt_tokens: 100000,
+                        prompt_tokens_details: { cached_tokens: 100000 },
+                        completion_tokens: 1,
+                        total_tokens: 100001,
+                      },
+                    }) +
+                    'data: [DONE]\n\n',
+                );
+              };
+              if (holdRefresh) {
+                releaseRefresh = finish;
+                refreshStarted?.();
+              } else finish();
+              return;
+            }
+            const first = ++realRequests === 1;
+            response.writeHead(200, { 'content-type': 'text/event-stream' });
+            response.end(
               chunk({
                 id: 'fixture-' + realRequests,
-                choices: [{ index: 0, delta: {}, finish_reason: first ? 'tool_calls' : 'stop' }],
-                usage: { prompt_tokens: 100000, completion_tokens: 20, total_tokens: 100020 },
+                choices: [
+                  {
+                    index: 0,
+                    delta: first
+                      ? {
+                          role: 'assistant',
+                          tool_calls: [
+                            {
+                              index: 0,
+                              id: 'fixture-wait',
+                              type: 'function',
+                              function: { name: 'fixture_wait', arguments: '{}' },
+                            },
+                          ],
+                        }
+                      : { role: 'assistant', content: 'Finished the synthetic wait.' },
+                  },
+                ],
               }) +
-              'data: [DONE]\n\n',
-          );
-        });
-      });
-      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-      t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
-      const address = server.address() as import('node:net').AddressInfo;
-      const credential = { type: 'endpoint' as const, url: `http://127.0.0.1:${address.port}/v1` };
-      const [catalog] = await createPiModelBackend().catalog('compatible', 'api_key', credential);
-      const definition = {
-        ...catalog,
-        spec: {
-          ...catalog.spec,
-          cost: { input: 20, output: 20, cacheRead: 1, cacheWrite: 20 },
-          promptCache: { short: 11 },
-        },
-      };
-      const sessionRoot = await mkdtemp(join(tmpdir(), 'nod-pi-cost-'));
-      const access = {
-        provider: 'compatible' as const,
-        method: 'api_key' as const,
-        definition,
-        effort: 'off' as const,
-        read: async () => credential,
-      };
-      const agent = createPiAgent({
-        provider: 'compatible',
-        sessionRoot,
-        resolve: async () => access,
-        traces: { active: () => true, record: (trace) => traces.push(trace) },
-        createSession: async (options) => {
-          const result = await createAgentSession(options);
-          current = result.session;
-          current.subscribe((event) => {
-            if (
-              event.type === 'entry_appended' &&
-              event.entry.type === 'usage' &&
-              event.entry.kind === 'cache_warm'
-            ) {
-              persistedRefreshes++;
-              completeRefresh();
-            }
+                chunk({
+                  id: 'fixture-' + realRequests,
+                  choices: [{ index: 0, delta: {}, finish_reason: first ? 'tool_calls' : 'stop' }],
+                  usage: { prompt_tokens: 100000, completion_tokens: 20, total_tokens: 100020 },
+                }) +
+                'data: [DONE]\n\n',
+            );
           });
-          return result;
-        },
-      });
-      t.after(async () => {
-        await agent.dispose();
-        await rm(sessionRoot, { recursive: true, force: true });
-      });
-      const session = await agent.open({
-        ...fakeExecution(randomUUID(), randomUUID()),
-        ...sandbox,
-        systemPrompt: 'Complete the synthetic wait once.',
-        shouldStop: () => false,
-        onEvent: (event) => {
-          if (event.type === 'model_usage') usage.push(event);
-          if (event.type === 'provider_usage') {
-            usage.push(event.usage);
-            if (event.usage.operation === 'cache_warm' && (outcome === 'failed' || changeContext))
-              completeRefresh();
-          }
-        },
-        tools: [
-          {
-            name: 'fixture_wait',
-            description: 'Wait for the synthetic result.',
-            parameters: { type: 'object', properties: {} },
-            eager: true,
-            execute: async () => {
-              tools++;
-              await Promise.race([
-                refreshCompleted,
-                setTimeout(5000, undefined, { ref: false }).then(() =>
-                  assert.fail('The synthetic cache refresh did not complete.'),
-                ),
-              ]);
-              return { content: [{ type: 'text', text: 'The synthetic wait finished.' }] };
-            },
+        });
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+        t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+        const address = server.address() as import('node:net').AddressInfo;
+        const credential = {
+          type: 'endpoint' as const,
+          url: `http://127.0.0.1:${address.port}/v1`,
+        };
+        const [catalog] = await createPiModelBackend().catalog('compatible', 'api_key', credential);
+        const definition = {
+          ...catalog,
+          spec: {
+            ...catalog.spec,
+            cost: { input: 20, output: 20, cacheRead: 1, cacheWrite: 20 },
+            promptCache: { short: 11 },
           },
-        ],
-      });
-      await session.prompt('Run the synthetic wait.', []);
-      await session.dispose();
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(tools, 1);
-      assert.equal(realRequests, 2);
-      assert.ok(requests > realRequests);
-      assert.equal(usage.length, requests);
-      assert.equal(traces.length, requests);
-      assert.equal(
-        traces.filter((trace) => trace.metadata.request_kind === 'regular').length,
-        realRequests,
-      );
-      assert.equal(
-        traces.filter((trace) => trace.metadata.request_kind === 'cache_warm').length,
-        requests - realRequests,
-      );
-      assert.equal(new Set(usage.map((row) => row.id)).size, requests);
-      const refreshes = usage.filter((row) => row.operation === 'cache_warm');
-      assert.equal(refreshes.length, requests - realRequests);
-      assert.equal(
-        persistedRefreshes,
-        outcome === 'succeeded' && !changeContext ? refreshes.length : 0,
-      );
-      assert.ok(refreshes.every((row) => row.status === outcome));
-      assert.ok(
-        refreshes.every((row) =>
-          outcome === 'failed'
-            ? row.costUsd === null
-            : typeof row.costUsd === 'number' && row.costUsd > 0,
-        ),
-      );
-      if (outcome === 'succeeded' && !changeContext) {
-        const cancelled: import('../src/ports/provider-usage.ts').ProviderUsageEvent[] = [];
-        const { runtime, model } = await createPiModelRuntime(access, {
-          reportCacheUsage: (row) => cancelled.push(row),
+        };
+        const sessionRoot = await mkdtemp(join(tmpdir(), 'nod-pi-cost-'));
+        const access = {
+          provider: 'compatible' as const,
+          method: 'api_key' as const,
+          definition,
+          effort: 'off' as const,
+          read: async () => credential,
+        };
+        const agent = createPiAgent({
+          provider: 'compatible',
+          sessionRoot,
+          resolve: async () => access,
+          traces: { active: () => true, record: (trace) => traces.push(trace) },
+          createSession: async (options) => {
+            const result = await createAgentSession(options);
+            current = result.session;
+            current.subscribe((event) => {
+              if (
+                event.type === 'entry_appended' &&
+                event.entry.type === 'usage' &&
+                event.entry.kind === 'cache_warm'
+              ) {
+                persistedRefreshes++;
+                completeRefresh();
+              }
+            });
+            return result;
+          },
         });
-        holdRefresh = true;
-        const received = new Promise<void>((resolve) => {
-          refreshStarted = resolve;
+        t.after(async () => {
+          await agent.dispose();
+          await rm(sessionRoot, { recursive: true, force: true });
         });
-        const controller = new AbortController();
-        const pending = runtime.streamSimple(
-          model,
-          {
-            messages: [
-              {
-                role: 'user',
-                content: [{ type: 'text', text: 'Synthetic cache refresh' }],
-                timestamp: Date.now(),
+        const session = await agent.open({
+          ...fakeExecution(randomUUID(), randomUUID()),
+          ...sandbox,
+          systemPrompt: 'Complete the synthetic wait once.',
+          shouldStop: () => false,
+          onEvent: (event) => {
+            if (event.type === 'model_usage') usage.push(event);
+            if (event.type === 'provider_usage') {
+              usage.push(event.usage);
+              if (event.usage.operation === 'cache_warm' && (outcome === 'failed' || changeContext))
+                completeRefresh();
+            }
+          },
+          tools: [
+            {
+              name: 'fixture_wait',
+              description: 'Wait for the synthetic result.',
+              parameters: { type: 'object', properties: {} },
+              eager: true,
+              execute: async () => {
+                tools++;
+                await Promise.race([
+                  refreshCompleted,
+                  setTimeout(5000, undefined, { ref: false }).then(() =>
+                    assert.fail('The synthetic cache refresh did not complete.'),
+                  ),
+                ]);
+                return { content: [{ type: 'text', text: 'The synthetic wait finished.' }] };
               },
-            ],
-          },
-          {
-            maxTokens: 1,
-            maxRetries: 0,
-            signal: controller.signal,
-            fetch: (input, init) => fetch(input, { ...init, signal: undefined }),
-          },
+            },
+          ],
+        });
+        await session.prompt('Run the synthetic wait.', []);
+        await session.dispose();
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(tools, 1);
+        assert.equal(realRequests, 2);
+        assert.ok(requests > realRequests);
+        assert.equal(usage.length, requests);
+        assert.equal(traces.length, requests);
+        assert.equal(
+          traces.filter((trace) => trace.metadata.request_kind === 'regular').length,
+          realRequests,
         );
-        await received;
-        controller.abort();
-        assert.equal(cancelled.length, 1);
-        assert.equal(cancelled[0].status, 'cancelled');
-        assert.equal(cancelled[0].costUsd, null);
-        releaseRefresh!();
-        await pending.result();
-        assert.equal(cancelled.length, 1);
-        assert.equal(requests, usage.length + cancelled.length);
-      }
-    });
-});
+        assert.equal(
+          traces.filter((trace) => trace.metadata.request_kind === 'cache_warm').length,
+          requests - realRequests,
+        );
+        assert.equal(new Set(usage.map((row) => row.id)).size, requests);
+        const refreshes = usage.filter((row) => row.operation === 'cache_warm');
+        assert.equal(refreshes.length, requests - realRequests);
+        assert.equal(
+          persistedRefreshes,
+          outcome === 'succeeded' && !changeContext ? refreshes.length : 0,
+        );
+        assert.ok(refreshes.every((row) => row.status === outcome));
+        assert.ok(
+          refreshes.every((row) =>
+            outcome === 'failed'
+              ? row.costUsd === null
+              : typeof row.costUsd === 'number' && row.costUsd > 0,
+          ),
+        );
+        if (outcome === 'succeeded' && !changeContext) {
+          const cancelled: import('../src/ports/provider-usage.ts').ProviderUsageEvent[] = [];
+          const { runtime, model } = await createPiModelRuntime(access, {
+            reportCacheUsage: (row) => cancelled.push(row),
+          });
+          holdRefresh = true;
+          const received = new Promise<void>((resolve) => {
+            refreshStarted = resolve;
+          });
+          const controller = new AbortController();
+          const pending = runtime.streamSimple(
+            model,
+            {
+              messages: [
+                {
+                  role: 'user',
+                  content: [{ type: 'text', text: 'Synthetic cache refresh' }],
+                  timestamp: Date.now(),
+                },
+              ],
+            },
+            {
+              maxTokens: 1,
+              maxRetries: 0,
+              signal: controller.signal,
+              fetch: (input, init) => fetch(input, { ...init, signal: undefined }),
+            },
+          );
+          await received;
+          controller.abort();
+          assert.equal(cancelled.length, 1);
+          assert.equal(cancelled[0].status, 'cancelled');
+          assert.equal(cancelled[0].costUsd, null);
+          releaseRefresh!();
+          await pending.result();
+          assert.equal(cancelled.length, 1);
+          assert.equal(requests, usage.length + cancelled.length);
+        }
+      });
+      cases.push(subtest);
+    }
+    await Promise.all(cases);
+  },
+);
 
 test('owner context stays out of the system prompt and compaction summaries and is added only when it changes', async (t) => {
   const { createServer } = await import('node:http');
@@ -10362,6 +10384,426 @@ test('model HTTP failures keep their response status within each request and ret
   assert.equal(statuses.length, 0);
   assert.equal(reports.length, 2);
   assert.ok(reports.every(({ status }) => status === 'failed'));
+});
+
+async function fallbackServer(t: TestContext, answer: (model: string) => number) {
+  const { createServer } = await import('node:http');
+  const requests: string[] = [];
+  const server = createServer((request, response) => {
+    const parts: Buffer[] = [];
+    request.on('data', (part) => parts.push(part));
+    request.on('end', () => {
+      const { model } = JSON.parse(Buffer.concat(parts).toString()) as { model: string };
+      requests.push(model);
+      const status = answer(model);
+      if (status !== 200) {
+        response.writeHead(status, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ error: { message: 'Synthetic failure.' } }));
+        return;
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.end(
+        `data: ${JSON.stringify({
+          id: `fixture-${model}`,
+          choices: [
+            { index: 0, delta: { content: `Answer from ${model}.` }, finish_reason: 'stop' },
+          ],
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        })}\n\ndata: [DONE]\n\n`,
+      );
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const url = `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}/v1`;
+  const access = (id: string, cost = 1): ModelAccess => {
+    const value = smallContextAccess('compatible', id, 131_072);
+    const pricing = { input: cost, output: cost, cacheRead: 0, cacheWrite: 0 };
+    value.definition = {
+      choice: { ...value.definition.choice, pricing },
+      spec: { ...value.definition.spec, baseUrl: url, cost: pricing },
+    };
+    value.read = async () => ({ type: 'endpoint', url, key: 'fixture-key' });
+    return { ...value, connectionId: `fixture-${id}` };
+  };
+  return { requests, access };
+}
+
+test('a busy work model gets one retry, then the same request continues on a backup, and a running helper follows', async (t) => {
+  const { modelPricingSignature } = await import('../src/shared/models.ts');
+  const directory = await mkdtemp(join(tmpdir(), 'nod-fallback-turn-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const { requests, access } = await fallbackServer(t, (model) =>
+    model === 'fixture-backup' ? 200 : 503,
+  );
+  const agent = createPiAgent({
+    provider: 'compatible',
+    resolve: async () => [access('fixture-primary'), access('fixture-backup', 5)],
+    sessionRoot: directory,
+    createSession: async (options) => {
+      options?.settingsManager?.applyOverrides({ retry: { baseDelayMs: 1, maxAgentDelayMs: 1 } });
+      return createAgentSession(options);
+    },
+  });
+  t.after(() => agent.dispose());
+  const execution = fakeExecution(randomUUID());
+  const open = (extra: object, events: AgentEvent[]) =>
+    agent.open({
+      ...execution,
+      ...extra,
+      ...sandbox,
+      systemPrompt: 'Synthetic fixture',
+      tools: [],
+      shouldStop: () => false,
+      onEvent: (event) => events.push(event),
+    });
+  const events: AgentEvent[] = [];
+  const main = await open({}, events);
+  const helper = await open(
+    { sessionId: randomUUID(), runId: randomUUID(), parentRunId: execution.runId },
+    [],
+  );
+  await main.prompt('Synthetic question.', []);
+  assert.deepEqual(requests, ['fixture-primary', 'fixture-primary', 'fixture-backup']);
+  assert.deepEqual(
+    events.filter((event) => event.type === 'fallback'),
+    [{ type: 'fallback', from: 'fixture-primary', to: 'fixture-backup' }],
+  );
+  const usage = events.flatMap((event) => (event.type === 'model_usage' ? [event] : []));
+  assert.deepEqual(
+    usage.map(({ model, status }) => [model, status]),
+    [
+      ['fixture-primary', 'failed'],
+      ['fixture-primary', 'failed'],
+      ['fixture-backup', 'succeeded'],
+    ],
+  );
+  assert.equal(
+    usage.at(-1)!.pricingSignature,
+    modelPricingSignature(
+      { input: 5, output: 5, cacheRead: 0, cacheWrite: 0 },
+      'openai-completions',
+    ),
+  );
+  assert.ok(events.some((event) => event.type === 'final' && /fixture-backup/.test(event.text)));
+
+  requests.length = 0;
+  await helper.prompt('Synthetic helper question.', []);
+  await helper.dispose();
+  await main.dispose();
+  assert.deepEqual(requests, ['fixture-backup']);
+});
+
+test('a turn fallback moves on after Pi gives up or at once on request errors, never after output, on a refusal, a Stop or the selected model overflowing, and sends a backup no primary credentials', async () => {
+  const { createTurnFallback } = await import('../src/providers/pi/fallback.ts');
+  const errors: Record<string, string> = {
+    busy: '503 Service Unavailable (HTTP 503)',
+    quota: '429 insufficient_quota: You exceeded your current quota (HTTP 429)',
+    overflow: 'prompt is too long: 213462 tokens > 131072 maximum',
+    partial: '503 Service Unavailable (HTTP 503)',
+    stop: '503 Service Unavailable (HTTP 503)',
+    refusal: 'The model declined to answer.',
+  };
+  const model = (id: string) =>
+    ({
+      provider: 'compatible',
+      id,
+      api: 'openai-completions',
+      input: ['text'],
+      contextWindow: 131_072,
+    }) as never;
+  const choice = (id: string, provider: 'openai' | 'compatible', paused = false): ModelAccess => ({
+    provider,
+    method: 'api_key',
+    effort: 'off',
+    read: async () => undefined,
+    ...(paused
+      ? {
+          prepareRequest: async () => {
+            throw new Error(`${id} is paused.`);
+          },
+        }
+      : {}),
+    definition: {
+      choice: {
+        id,
+        name: id,
+        efforts: ['off'],
+        images: id === 'fixture-last',
+        contextWindow: 131_072,
+      },
+      spec: {},
+    },
+  });
+  const setup = (script: Record<string, Array<string | undefined>>, stop?: AbortController) => {
+    const calls: Array<{ id: string; timeoutMs?: number; credentials: boolean }> = [];
+    let retrying = false;
+    const phases = new WeakMap<object, { requestPhase: string }>();
+    const connection = (id: string) => ({
+      model: model(id),
+      requestFacts: (message: object) => phases.get(message),
+      runtime: {
+        streamSimple: (
+          _target: never,
+          _context: never,
+          options?: { timeoutMs?: number; apiKey?: string; headers?: object },
+        ) => {
+          calls.push({
+            id,
+            timeoutMs: options?.timeoutMs,
+            credentials: Boolean(options?.apiKey || options?.headers),
+          });
+          const outcome = script[id]!.shift();
+          if (outcome === 'stop') stop?.abort();
+          const message = {
+            ...fauxAssistantMessage(outcome ? '' : `Answer from ${id}.`),
+            provider: 'compatible',
+            model: id,
+            api: 'openai-completions',
+            ...(outcome ? { stopReason: 'error' as const, errorMessage: errors[outcome] } : {}),
+          } as AssistantMessage;
+          phases.set(message, { requestPhase: outcome === 'refusal' ? 'stream' : 'response' });
+          const stream = createAssistantMessageEventStream();
+          if (outcome === 'partial')
+            stream.push({ type: 'text_delta', contentIndex: 0, delta: 'Part', partial: message });
+          stream.push(
+            outcome
+              ? { type: 'error', reason: 'error', error: message }
+              : { type: 'done', reason: 'stop', message },
+          );
+          stream.end(message);
+          return stream;
+        },
+      },
+    });
+    const work = connection('fixture-work');
+    const moved: Array<[number, number]> = [];
+    const fallback = createTurnFallback({
+      primary: {
+        access: choice('fixture-work', 'openai'),
+        connection: work as never,
+        stream: work.runtime.streamSimple as never,
+      },
+      backups: [
+        choice('fixture-first', 'openai'),
+        choice('fixture-paused', 'openai', true),
+        choice('fixture-last', 'compatible'),
+      ],
+      start: 0,
+      automatic: true,
+      connect: async (backup) => connection(backup.definition.choice.id) as never,
+      retrying: () => retrying,
+      shared: () => 0,
+      switched: () => {},
+      moved: (from, to) => moved.push([from, to]),
+      failed: () => {},
+    });
+    const send = (retry: boolean, signal?: AbortSignal, content?: UserMessage['content']) => {
+      retrying = retry;
+      return fallback
+        .stream(
+          work.model,
+          { messages: content ? [{ role: 'user', content, timestamp: 1 }] : [] },
+          { timeoutMs: 1234, signal, apiKey: 'fixture-work-key', headers: { 'x-work': '1' } },
+        )
+        .result();
+    };
+    return { calls, moved, fallback, send };
+  };
+
+  const moving = setup({
+    'fixture-work': ['busy', 'busy'],
+    'fixture-first': [undefined, 'quota'],
+    'fixture-last': [undefined],
+  });
+  assert.equal((await moving.send(true)).stopReason, 'error');
+  assert.equal((await moving.send(false)).stopReason, 'stop');
+  assert.equal((await moving.send(true)).stopReason, 'stop');
+  assert.deepEqual(moving.calls, [
+    { id: 'fixture-work', timeoutMs: 1234, credentials: true },
+    { id: 'fixture-work', timeoutMs: 1234, credentials: true },
+    { id: 'fixture-first', timeoutMs: 1234, credentials: false },
+    { id: 'fixture-first', timeoutMs: 1234, credentials: false },
+    { id: 'fixture-last', timeoutMs: 1234, credentials: false },
+  ]);
+  assert.deepEqual(moving.moved, [
+    [0, 1],
+    [1, 3],
+  ]);
+
+  const pictured = setup({ 'fixture-work': ['quota'], 'fixture-last': [undefined] });
+  const image = [{ type: 'image' as const, data: 'AA==', mimeType: 'image/png' }];
+  assert.equal((await pictured.send(true, undefined, image)).stopReason, 'stop');
+  assert.deepEqual(
+    pictured.calls.map(({ id }) => id),
+    ['fixture-work', 'fixture-last'],
+  );
+
+  const crowded = setup({
+    'fixture-work': ['busy'],
+    'fixture-first': ['overflow'],
+    'fixture-last': [undefined],
+  });
+  assert.equal((await crowded.send(false)).stopReason, 'stop');
+  assert.deepEqual(
+    crowded.calls.map(({ id }) => id),
+    ['fixture-work', 'fixture-first', 'fixture-last'],
+  );
+
+  for (const outcome of ['overflow', 'partial', 'stop', 'refusal']) {
+    const stop = new AbortController();
+    const staying = setup({ 'fixture-work': [outcome] }, stop);
+    assert.equal((await staying.send(false, stop.signal)).stopReason, 'error');
+    assert.equal(staying.fallback.switched(), false, outcome);
+    assert.deepEqual(
+      staying.calls.map(({ id }) => id),
+      ['fixture-work'],
+    );
+  }
+});
+
+test('a turn fallback moves a text-only request off a native-audio model and prices each attempt with the model that served it', async () => {
+  const { createTurnFallback } = await import('../src/providers/pi/fallback.ts');
+  const busy = '503 Service Unavailable (HTTP 503)';
+  const connection = (provider: string, id: string, input: number, failing: boolean) => {
+    const model = {
+      provider,
+      id,
+      api: 'openai-completions',
+      input: ['text'],
+      contextWindow: 131_072,
+      cost: { input, output: input, cacheRead: 0, cacheWrite: 0 },
+    };
+    return {
+      model,
+      runtime: {
+        streamSimple: () => {
+          const message = {
+            ...fauxAssistantMessage(failing ? '' : 'Synthetic answer.'),
+            provider,
+            model: id,
+            api: 'openai-completions',
+            ...(failing ? { stopReason: 'error' as const, errorMessage: busy } : {}),
+          } as AssistantMessage;
+          const stream = createAssistantMessageEventStream();
+          stream.push(
+            failing
+              ? { type: 'error', reason: 'error', error: message }
+              : { type: 'done', reason: 'stop', message },
+          );
+          stream.end(message);
+          return stream;
+        },
+        getModel: () => undefined,
+      },
+    };
+  };
+  const choice = (provider: 'openai' | 'compatible', id: string): ModelAccess => ({
+    provider,
+    method: 'api_key',
+    effort: 'off',
+    read: async () => undefined,
+    definition: {
+      choice: { id, name: id, efforts: ['off'], images: false, contextWindow: 131_072 },
+      spec: {},
+    },
+  });
+  for (const [provider, id] of [
+    ['openai', 'gpt-audio-1.5'],
+    ['compatible', 'fixture-shared'],
+  ] as const) {
+    const work = connection(provider, id, 1, true);
+    const fallback = createTurnFallback({
+      primary: {
+        access: choice(provider, id),
+        connection: work as never,
+        stream: work.runtime.streamSimple as never,
+      },
+      backups: [choice('compatible', 'fixture-shared')],
+      start: 0,
+      automatic: false,
+      connect: async () => connection('compatible', 'fixture-shared', 5, false) as never,
+      retrying: () => false,
+      shared: () => 0,
+      switched: () => {},
+      moved: () => {},
+      failed: () => {},
+    });
+    const result = await fallback
+      .stream(work.model as never, {
+        messages: [{ role: 'user', content: 'Synthetic question.', timestamp: 1 }],
+      })
+      .result();
+    assert.equal(result.stopReason, 'stop');
+    assert.equal(fallback.model(result)?.cost.input, 5);
+  }
+});
+
+test('an automatic turn starts on the first model that takes automatic requests, or fails with the first reason', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'nod-fallback-paused-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const { requests, access } = await fallbackServer(t, () => 200);
+  const turn = async (refused: string[]) => {
+    const refusing = (id: string): ModelAccess => ({
+      ...access(id),
+      prepareRequest: async (_id, automatic) => {
+        if (automatic && refused.includes(id)) throw new Error(`Synthetic ${id} is paused.`);
+        return async () => {};
+      },
+    });
+    const agent = createPiAgent({
+      provider: 'compatible',
+      resolve: async () => [refusing('fixture-primary'), refusing('fixture-backup')],
+      sessionRoot: directory,
+    });
+    t.after(() => agent.dispose());
+    const session = await agent.open({
+      ...fakeExecution(randomUUID()),
+      ...sandbox,
+      automatic: true,
+      systemPrompt: 'Synthetic fixture',
+      tools: [],
+      shouldStop: () => false,
+      onEvent: () => {},
+    });
+    await session.prompt('Synthetic question.', []);
+    await session.dispose();
+  };
+  await turn(['fixture-primary']);
+  assert.deepEqual(requests, ['fixture-backup']);
+  requests.length = 0;
+  await assert.rejects(
+    turn(['fixture-primary', 'fixture-backup']),
+    /Synthetic fixture-primary is paused/,
+  );
+  assert.deepEqual(requests, []);
+});
+
+test('recall moves to the next backup after one failed request and reports every attempt', async (t) => {
+  const { requests, access } = await fallbackServer(t, (model) =>
+    model === 'fixture-backup' ? 200 : 503,
+  );
+  const usage: string[] = [];
+  const recall = (models: string[]) =>
+    createPiMemoryCurator({
+      provider: 'compatible',
+      resolve: async () => models.map((id) => access(id)),
+    }).curate(
+      { task: 'recall', instructions: 'Synthetic recall.', input: {} },
+      undefined,
+      (event) => usage.push(`${event.model}:${event.status}`),
+    );
+  assert.equal(await recall(['fixture-primary', 'fixture-backup']), null);
+  assert.deepEqual(requests, ['fixture-primary', 'fixture-backup']);
+  assert.deepEqual(usage, ['fixture-primary:failed', 'fixture-backup:succeeded']);
+  requests.length = 0;
+  await assert.rejects(recall(['fixture-primary', 'fixture-other']), /fixture-other/);
+  assert.deepEqual(requests, [
+    'fixture-primary',
+    'fixture-other',
+    'fixture-other',
+    'fixture-other',
+  ]);
 });
 
 test('action review failures identify the task, model, provider, and bounded provider reason', async (t) => {
