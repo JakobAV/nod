@@ -26,6 +26,7 @@ self.addEventListener('push', (event) => {
         body: 'Nod has a new reply for you.',
         icon: '/nod-logo.png',
         tag: 'nod-reply',
+        renotify: true,
       });
     }),
   );

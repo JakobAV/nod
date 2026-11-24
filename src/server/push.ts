@@ -79,6 +79,7 @@ export async function createPush(sender: PushSender) {
           logFailure('push_send', error);
           return 0;
         });
+        console.log(JSON.stringify({ event: 'push_send', status }));
         if (status === 404 || status === 410)
           await pool.query('DELETE FROM push_subscriptions WHERE owner_id=$1 AND endpoint=$2', [
             ownerId,
