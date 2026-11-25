@@ -615,6 +615,18 @@ test(
           throw new OutputLimitError('Synthetic output limit.');
         if (context.prompt === 'tool refusal fixture')
           throw new ToolFailureError('The bash tool failed five times. Trust refused the command.');
+        if (context.prompt === 'disk full fixture')
+          throw Object.assign(new Error('ENOSPC: no space left on device, write'), {
+            code: 'ENOSPC',
+            syscall: 'write',
+          });
+        if (context.prompt === 'local connection fixture')
+          throw Object.assign(new Error('connect EADDRINUSE 127.0.0.1:59024'), {
+            code: 'EADDRINUSE',
+            syscall: 'connect',
+            address: '127.0.0.1',
+            port: 59024,
+          });
         if (context.prompt.startsWith('session-fixture')) {
           await sessionGates.get(context.prompt);
           return { status: 'succeeded' };
@@ -3593,6 +3605,42 @@ test(
           (await db.pool.query('SELECT count(*) FROM feedback_drafts')).rows[0].count,
           drafts,
         );
+      });
+
+      await t.test('host failures keep their cause and split bug reports by code', async () => {
+        const fail = async (prompt: string) => {
+          const failed = await thread.submitUserMessage(prompt);
+          await waitFor(settled(failed.turnId));
+          await waitFor(
+            async () =>
+              (
+                await db.pool.query(
+                  "SELECT 1 FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+                  [failed.turnId, `failure:${failed.turnId}`],
+                )
+              ).rowCount === 1,
+          );
+          return (
+            await db.pool.query(
+              `SELECT u.error,m.presentation FROM turns u JOIN messages m ON m.turn_id=u.id
+               WHERE u.id=$1 AND m.stream_id=$2`,
+              [failed.turnId, `failure:${failed.turnId}`],
+            )
+          ).rows[0];
+        };
+        const drafts = (await db.pool.query('SELECT count(*) FROM feedback_drafts')).rows[0].count;
+        const full = await fail('disk full fixture');
+        assert.match(full.error, /ENOSPC: no space left on device, write/);
+        assert.equal(full.presentation, null);
+        assert.equal(
+          (await db.pool.query('SELECT count(*) FROM feedback_drafts')).rows[0].count,
+          drafts,
+        );
+        const local = await fail('local connection fixture');
+        assert.match(local.error, /connect EADDRINUSE 127\.0\.0\.1:59024/);
+        assert.equal(local.presentation.type, 'bug-report');
+        assert.match(local.presentation.summary, /\(EADDRINUSE\)/);
+        assert.doesNotMatch(local.presentation.summary, /127\.0\.0\.1|59024/);
       });
 
       await t.test('a reached spending limit pauses all but owner messages', async (t) => {
@@ -6786,7 +6834,7 @@ test(
       await t.test(
         'clear keeps admitted task and schedule instructions while stopping chat',
         async () => {
-          const { captureOwnerInstructions, validateOwnerInstructions } =
+          const { recentOwnerWords, validateOwnerInstructions } =
             await import('../src/server/owner-instructions.ts');
           const { turnOrigin } = await import('../src/server/approvals.ts');
           const restriction = 'Do not publish synthetic project data.';
@@ -6829,22 +6877,12 @@ test(
             const origin = await turnOrigin(child!.turnId);
             assert.ok(origin);
             const capture = () =>
-              captureOwnerInstructions(
-                db.pool,
-                ownerId,
-                creator.threadId,
-                origin.messageIds,
-                task!.id,
-                new Date(0),
-                child!.turnId,
-              );
+              recentOwnerWords(db.pool, ownerId, creator.threadId, origin.messageIds);
+            const said = (words: Awaited<ReturnType<typeof capture>>) =>
+              (words.words.userMessages ?? []).map((message) => message.text);
             const before = await capture();
-            assert.ok(before?.authorizingIds.includes(creator.messageId));
-            const priorLimit = before?.words.userMessages?.find(
-              (message) => message.text === restriction,
-            );
-            assert.ok(priorLimit);
-            assert.equal(priorLimit.canAuthorize, false);
+            assert.ok(said(before).includes(prompt));
+            assert.ok(said(before).includes(restriction));
             const args = {
               title: 'Synthetic saved monitor',
               prompt: 'Read the synthetic project report daily.',
@@ -6852,20 +6890,17 @@ test(
               cron: '0 9 * * *',
               timeZone: 'UTC',
             };
-            const chatEvidence = await captureOwnerInstructions(
-              db.pool,
-              ownerId,
-              creator.threadId,
-              [creator.messageId],
-              null,
-              new Date(0),
-              creator.turnId,
-            );
+            const chatEvidence = await recentOwnerWords(db.pool, ownerId, creator.threadId, [
+              creator.messageId,
+            ]);
             const prepared = await personal.prepareScheduleChange('schedule_create', args);
             schedule = (await personal.manage('schedule_create', args, {
               turnId: creator.turnId,
               sourceMessageId: creator.messageId,
-              instructionChange: { ...prepared, evidence: chatEvidence!.evidence },
+              instructionChange: {
+                ...prepared,
+                evidence: chatEvidence.evidence(creator.messageId),
+              },
             })) as { id: string };
             const savedEvidence = (
               await db.pool.query('SELECT authority FROM schedules WHERE id=$1', [schedule.id])
@@ -6887,32 +6922,31 @@ test(
             assert.equal(record.state, 'open');
             const after = await capture();
             await validateOwnerInstructions(db.pool, ownerId, savedEvidence);
-            assert.deepEqual(
-              after?.words.userMessages?.find((message) => message.text === restriction),
-              priorLimit,
-            );
+            assert.ok(said(after).includes(restriction));
             releaseMain();
             const freshPrompt = 'Give the synthetic monitor status only.';
             block(freshPrompt);
             const fresh = await thread.submitUserMessage(freshPrompt);
             await waitFor(() => Boolean(ran(fresh.turnId)));
             try {
-              const newChat = await captureOwnerInstructions(
-                db.pool,
-                ownerId,
-                creator.threadId,
-                [fresh.messageId],
-                null,
-                new Date(Date.now() - 86_400_000),
-                fresh.turnId,
-              );
-              assert.equal(newChat?.authorizingIds.includes(creator.messageId) ?? false, false);
-              assert.ok(newChat?.authorizingIds.includes(fresh.messageId));
+              const newChat = await recentOwnerWords(db.pool, ownerId, creator.threadId, [
+                fresh.messageId,
+              ]);
+              assert.equal(said(newChat).includes(prompt), false);
+              assert.equal(said(newChat).includes(restriction), false);
+              assert.ok(said(newChat).includes(freshPrompt));
               const { createTrust } = await import('../src/server/trust.ts');
               const oldGrant = await createTrust({
                 pool: db.pool,
                 ownerId,
-                review: async () => ({ run: true, because: prompt }),
+                review: async (_instructions, input) => {
+                  const index = (
+                    (input as { userMessages?: Array<{ text: string }> }).userMessages ?? []
+                  ).findIndex((message) => message.text === prompt);
+                  return index < 0
+                    ? { run: false }
+                    : { run: true, source: `message:${index}`, terms: [] };
+                },
               }).check(
                 { threadId: creator.threadId, turnId: fresh.turnId },
                 'SYNTHETIC_SEND_REPORT',
@@ -6927,15 +6961,15 @@ test(
                 ).rows[0],
                 { status: 'cancelled', withdrawn: false, error: null },
               );
-              assert.ok((await capture())?.authorizingIds.includes(creator.messageId));
+              assert.ok(said(await capture()).includes(prompt));
               await validateOwnerInstructions(db.pool, ownerId, savedEvidence);
             } finally {
               release(freshPrompt);
               await waitFor(settled(fresh.turnId));
             }
             assert.ok(
-              after?.authorizingIds.includes(creator.messageId),
-              'The active independent task lost its owner authority after /clear.',
+              said(after).includes(prompt),
+              'The active independent task lost its owner request after /clear.',
             );
           } finally {
             releaseMain();
