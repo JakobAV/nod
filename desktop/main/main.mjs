@@ -25,7 +25,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
-import { homedir } from 'node:os';
+import { homedir, uptime } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
@@ -47,6 +47,7 @@ import { createAppPreferencesStore } from './app-preferences.mjs';
 import { createComputerHelper } from './computer-helper.mjs';
 import { createComputerOverlay } from './computer-overlay.mjs';
 import { createChatReadCursorStore } from './chat-read-cursors.mjs';
+import { chromiumFetch } from './chromium-fetch.mjs';
 import { registerArtifactFileHandlers } from './artifact-file-handlers.mjs';
 import { saveArtifactDownload } from './downloads.mjs';
 import { createDesktopLifecycle, startupErrorDetails } from './lifecycle.mjs';
@@ -186,8 +187,23 @@ let freshAppOpenCapture;
 let appOpeningDeferred = false;
 let appOpeningConsentVersion = 0;
 let localSetupObservation;
+const secondsSinceBootAtLaunch = uptime();
 const claimedAppOpens = new Set();
 const appUIOpenings = new Map();
+function loginItemState() {
+  try {
+    return opensAtLogin() ? 'registered' : 'not_registered';
+  } catch {
+    return 'unknown';
+  }
+}
+function sinceBootAtLaunch() {
+  return secondsSinceBootAtLaunch < 300
+    ? 'under_5m'
+    : secondsSinceBootAtLaunch < 3600
+      ? 'under_1h'
+      : 'over_1h';
+}
 function deferAppOpening() {
   appOpeningDeferred = true;
   appOpeningConsentVersion++;
@@ -323,6 +339,7 @@ const lifecycle = createDesktopLifecycle({
         preserveRuntimeCache: testInstall,
         computerDirectory: await settings.computerDirectory(),
         resolveDownloadUrl: updateSource?.runtimeDownloadUrl,
+        fetch: chromiumFetch,
         signal,
         onStatus: (value) => {
           step = typeof value === 'string' ? value : value?.message;
@@ -361,6 +378,7 @@ const lifecycle = createDesktopLifecycle({
       ...value,
       message: bounded(value.message),
       details: value.details ? bounded(value.details, 256 * 1024) : undefined,
+      failure: value.failure ? startupErrorFacts(value.failure) : undefined,
     };
     if (value.phase === 'error')
       void writeDiagnostic([runtime.message, runtime.details].filter(Boolean).join('\n')).catch(
@@ -462,7 +480,7 @@ function update(value) {
     message: bounded(value.message || status.message),
   };
   if (value.phase === 'ready' || value.phase === 'error') status.unlockingKeys = false;
-  if (value.phase && value.phase !== 'error') delete status.failure;
+  if (value.phase && (value.phase !== 'error' || !value.failure)) delete status.failure;
   if (value.error) status.error = bounded(value.error);
   else if (Object.hasOwn(value, 'error') || (value.phase && value.phase !== 'error'))
     delete status.error;
@@ -1662,11 +1680,18 @@ function captureLocalSetup() {
       : ['idle', 'preparing', 'starting', 'ready'].includes(value)
         ? value
         : 'unknown';
+  const failure =
+    (status.phase === 'error' && status.failure) ||
+    (status.runtime?.phase === 'error' && status.runtime.failure) ||
+    {};
+  const code = failure.code ?? failure.errno;
   const properties = {
     runtime_status: phase(status.runtime?.phase),
     startup_status: phase(status.phase),
     setup_available: status.engineReady === true,
     platform: ['darwin', 'win32', 'linux'].includes(process.platform) ? process.platform : 'other',
+    ...(code && { failure_code: code }),
+    ...(failure.step && { failure_step: failure.step }),
   };
   const key = JSON.stringify(properties);
   if (observation.previous === key) return;
@@ -3194,7 +3219,10 @@ else {
         const windows = process.platform === 'win32';
         if (windows)
           await clearInstalledWindowsUpdates(windowsUpdates, app.getVersion()).catch(() => {});
-        updateSource = createUpdateSource({ sourceUrl: nodBuild?.updateSourceUrl });
+        updateSource = createUpdateSource({
+          sourceUrl: nodBuild?.updateSourceUrl,
+          fetch: chromiumFetch,
+        });
         updates = createDesktopUpdater({
           source: updateSource,
           currentVersion: app.getVersion(),
@@ -3224,6 +3252,7 @@ else {
                 directory: windowsUpdates,
                 resourcesPath: engineRoot,
                 signal,
+                fetch: chromiumFetch,
                 includeRuntime,
                 onProgress: (progress) => report('downloading', progress),
               });
@@ -3243,6 +3272,7 @@ else {
               resourcesPath: engineRoot,
               downloadUrl: candidate.downloadUrl,
               signal,
+              fetch: chromiumFetch,
               onStatus: ({ progress }) => {
                 if (Number.isFinite(progress)) report('downloading', progress);
               },
@@ -3507,7 +3537,9 @@ else {
             openedAt: native?.openedAt ?? Date.now(),
             uuid: native?.uuid ?? randomUUID(),
             entry: native ? 'native_setup' : 'app_ui',
-            ...(native ? { serverConnectionTelemetryAvailable: true } : {}),
+            ...(native
+              ? { serverConnectionTelemetryAvailable: true }
+              : { loginItem: loginItemState(), sinceBoot: sinceBootAtLaunch() }),
           };
           appUIOpenings.set(distinctId, opening);
         }

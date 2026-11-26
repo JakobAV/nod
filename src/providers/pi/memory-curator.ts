@@ -16,7 +16,7 @@ import { lightestEffort, modelPricingSignature } from '../../shared/models.ts';
 import type { MemoryCurator } from '../../ports/memory-curator.ts';
 import { agentModels, memoryModels } from '../../shared/model-defaults.ts';
 import { piUsageMetrics } from './usage.ts';
-import { piModelTrace } from './traces.ts';
+import { capturePiModelCall, piModelTrace } from './traces.ts';
 import type { ProviderUsageEvent } from '../../ports/provider-usage.ts';
 import type { ModelTraces } from '../../ports/traces.ts';
 
@@ -166,8 +166,7 @@ export function createPiMemoryCurator(options: {
           }
         }
       const traceTurnId = crypto.randomUUID();
-      const bounded =
-        task === 'classify' || task === 'attention' || task === 'check' || task === 'activity';
+      const bounded = task === 'classify' || task === 'attention' || task === 'activity';
       const turnBound =
         signal !== undefined && ['review', 'access', 'skill', 'remember'].includes(task);
       if (options.resolve) loaded = undefined;
@@ -301,13 +300,23 @@ export function createPiMemoryCurator(options: {
           report?.(usage);
         }
         const target = runtime.getModel(reply.provider, reply.model) ?? model;
+        const call = {
+          model: target,
+          context,
+          message: reply,
+          startedAt,
+          request: requestFacts?.(reply),
+        };
         if (!untraced.has(task) && options.traces?.active())
           options.traces.record(
-            piModelTrace(
-              { model: target, context, message: reply, startedAt, request: requestFacts?.(reply) },
-              { source: 'curator', task, session_id: traceTurnId, turn_id: traceTurnId },
-            ),
+            piModelTrace(call, {
+              source: 'curator',
+              task,
+              session_id: traceTurnId,
+              turn_id: traceTurnId,
+            }),
           );
+        capturePiModelCall(options.traces, call, { source: 'curator', task });
         return reply;
       };
       const reply = await retryAssistantCall(
