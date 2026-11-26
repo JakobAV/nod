@@ -53,7 +53,6 @@ export const memoryModels: Partial<Record<ModelProvider, string>> = {
   opencode: 'gpt-6-luna',
   'vercel-ai-gateway': 'openai/gpt-6-luna',
   radius: 'cheap',
-  compatible: 'gpt-6-luna',
 };
 
 export function defaultModel(provider: ModelProvider, models: ModelChoice[], method?: ModelMethod) {
