@@ -355,6 +355,7 @@ export function modelEnvironment(
 
 export function createDefaultAdapters(
   env: Record<string, string | undefined> = process.env,
+  computer?: { ready(signal?: AbortSignal): Promise<void>; available(): boolean },
 ): ApplicationAdapters {
   const bootstrap = modelEnvironment(env);
   const { provider } = bootstrap;
@@ -536,7 +537,11 @@ export function createDefaultAdapters(
       configRoot: join(dataRoot, 'pi'),
       traces,
     }),
-    computer: createContainerBrowserComputer({ dataRoot, container: env.BROWSER_CONTAINER }),
+    computer: createContainerBrowserComputer({
+      dataRoot,
+      container: env.BROWSER_CONTAINER,
+      ready: computer?.ready,
+    }),
     passwordManager: createOnePassword({
       open: desktopMode ? desktopOnePassword() : forkedOnePassword(env.NOD_APP_VERSION || 'source'),
     }),
@@ -546,6 +551,8 @@ export function createDefaultAdapters(
     workspace: createDockerWorkspace({
       container: env.WORKSPACE_CONTAINER || 'nod-workspace',
       workspaceRoot: join(dataRoot, 'workspaces'),
+      ready: computer?.ready,
+      available: computer?.available,
     }),
     localSpeech,
     speechInputFormat: (voice) => {
@@ -744,7 +751,6 @@ export async function createApplication(
     channels?: boolean;
     heartbeat?: boolean;
     rateLimit?: boolean;
-    runtimeReady?: Promise<void>;
     starting?: (step: string) => void;
   } = {},
 ) {
@@ -780,7 +786,6 @@ async function initializeApplication(
     channels?: boolean;
     heartbeat?: boolean;
     rateLimit?: boolean;
-    runtimeReady?: Promise<void>;
     starting?: (step: string) => void;
   },
   diagnostics: {
@@ -855,28 +860,6 @@ async function initializeApplication(
   const admission = createWorkAdmission();
   const consumers = createWorkConsumers();
   const closing = new AbortController();
-  if (options.runtimeReady) await consumers.pause();
-  const runtimeReady =
-    options.runtimeReady?.then(() => {
-      if (!closing.signal.aborted) return consumers.resume();
-    }) ?? Promise.resolve();
-  void runtimeReady.catch(() => {});
-  async function prepareRuntime(signal: AbortSignal) {
-    const lifetime = AbortSignal.any([signal, closing.signal]);
-    lifetime.throwIfAborted();
-    let aborted: () => void;
-    try {
-      await Promise.race([
-        runtimeReady,
-        new Promise<never>((_, reject) => {
-          aborted = () => reject(lifetime.reason);
-          lifetime.addEventListener('abort', aborted, { once: true });
-        }),
-      ]);
-    } finally {
-      lifetime.removeEventListener('abort', aborted!);
-    }
-  }
   const privacyNotice = await loadPrivacyNoticeFile(process.env.NOD_PRIVACY_NOTICE_FILE);
   await mkdir(dataRoot, { recursive: true, mode: 0o700 });
   options.starting?.('database');
@@ -2602,6 +2585,7 @@ async function initializeApplication(
       consumers,
       artifacts,
       writeArtifact: workspace.writeArtifact.bind(workspace),
+      workspaceAvailable: () => workspace.available?.() !== false,
       readArtifact: workspace.readArtifact.bind(workspace),
       cardImage: previews?.image ? (url, signal) => previews.image!(url, signal) : undefined,
       mapTile: previews?.mapTile
@@ -3581,7 +3565,6 @@ async function initializeApplication(
     developerIds,
     turnTraceIds,
     start: welcome,
-    prepare: prepareRuntime,
     onboardingMissing: async () => (adapters.model.configured ? null : 'brain'),
     traces: adapters.traces?.available ?? false,
     onTraces: (enabled) => adapters.traces?.configure({ enabled }),

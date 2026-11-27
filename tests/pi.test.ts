@@ -867,6 +867,28 @@ test('small Pi sessions save full output and keep nested results available to sc
   await session.dispose();
 });
 
+test('an oversized result keeps an inline preview while the workspace is unavailable', async () => {
+  const { createContextOutput } = await import('../src/providers/pi/context-output.ts');
+  let commands = 0;
+  const output = createContextOutput({
+    path: '/workspace/fixture',
+    instructions: '',
+    available: () => false,
+    exec: async () => {
+      commands++;
+      return { exitCode: 0 };
+    },
+  });
+  const full = `${'synthetic result line\n'.repeat(5000)}synthetic last line`;
+  const saved = JSON.parse(await output.save([{ type: 'text', text: full }], 1000));
+  assert.equal(commands, 0);
+  assert.equal(saved.workspaceFile, undefined);
+  assert.equal(saved.characters, full.length);
+  assert.ok(saved.preview.startsWith('synthetic result line'));
+  assert.ok(saved.tail.endsWith('synthetic last line'));
+  assert.match(saved.message, /unavailable/);
+});
+
 test('direct image results save over-budget images in the workspace', async (t) => {
   const { workspace, prefix, root } = await hostSandbox(t);
   const directory = await mkdtemp(join(tmpdir(), 'nod-image-output-'));
@@ -3447,7 +3469,7 @@ test('task handoff shows only the start message unless a steered request needs a
 test('a paused turn cannot start a subagent still preparing and failed children return errors', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'nod-delegate-stop-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  let opened = 0;
+  let started = 0;
   let preparing = 0;
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
@@ -3457,13 +3479,14 @@ test('a paused turn cannot start a subagent still preparing and failed children 
     agent: {
       open: async (input) => {
         const child = Boolean(input.ephemeral);
-        if (child) opened++;
+        if (child && ++preparing === 3) await gate;
         return {
           resumed: false,
           abort: () => release(),
           dispose() {},
           prompt: async () => {
             if (child) {
+              started++;
               await gate;
               input.onEvent({ type: 'error', message: '402 Insufficient credits' });
               input.onEvent({ type: 'message_end', status: 'failed' });
@@ -3479,7 +3502,7 @@ test('a paused turn cannot start a subagent still preparing and failed children 
               .find((tool) => tool.name === 'ask_user')!
               .execute({ question: 'Which source should I use?' });
             const outcomes = await Promise.allSettled(pending);
-            assert.equal(opened, 2);
+            assert.equal(started, 2);
             assert.ok(outcomes.every((outcome) => outcome.status === 'rejected'));
             assert.ok(
               outcomes
@@ -3502,10 +3525,7 @@ test('a paused turn cannot start a subagent still preparing and failed children 
       open: () => ({
         path: '/fixture/workspace',
         instructions: 'Fixture workspace only.',
-        exec: async () => {
-          if (++preparing === 3) await gate;
-          return { exitCode: 0 };
-        },
+        exec: async () => ({ exitCode: 0 }),
       }),
     }),
   });

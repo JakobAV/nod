@@ -218,6 +218,7 @@ export interface ConnectedCliResult {
 export interface WorkspaceSession {
   path: string;
   instructions: string;
+  available?(): boolean;
   exec(command: string, options?: WorkspaceExecOptions): Promise<{ exitCode: number }>;
   runConnectedCli?(
     cli: ConnectedCli,
@@ -228,6 +229,7 @@ export interface WorkspaceSession {
 }
 export interface Workspace {
   connectedCliAvailable?: boolean;
+  available?(): boolean;
   writeArtifact(
     threadId: string,
     path: string,
