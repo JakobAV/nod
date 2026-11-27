@@ -2422,6 +2422,48 @@ test('computer use refuses blocked apps, keeps browsers view-only and acts only 
   });
   assert.equal(computer.needsCheck('COMPUTER_TYPE', replacing), true);
   assert.equal(replacing.replacesText, true);
+  findings[0]!.states = ['focused'];
+  await computer.execute(
+    turn,
+    'COMPUTER_TYPE',
+    await computer.prepare(turn, 'COMPUTER_TYPE', { ref: '@sfind001:e1', text: 'Testing' }),
+  );
+  const appending = await computer.prepare(turn, 'COMPUTER_TYPE', {
+    ref: '@sfind001:e1',
+    text: ' — done',
+  });
+  assert.equal(appending.replacesText, false);
+  assert.equal(
+    (await computer.prepare(turn, 'COMPUTER_SET_VALUE', { ref: '@sfind001:e1', text: 'New' }))
+      .replacesText,
+    true,
+  );
+  delete findings[0]!.states;
+  await assert.rejects(
+    computer.execute(turn, 'COMPUTER_TYPE', appending),
+    (error: Error & { notRun?: boolean }) =>
+      error.notRun === true && /keyboard focus changed/.test(error.message),
+  );
+  findings[0]!.states = ['focused'];
+  await computer.execute(
+    turn,
+    'COMPUTER_FOCUS',
+    await computer.prepare(turn, 'COMPUTER_FOCUS', { ref: '@sfind001:e1' }),
+  );
+  const afterFocus = await computer.prepare(turn, 'COMPUTER_TYPE', {
+    ref: '@sfind001:e1',
+    text: 'All new',
+  });
+  assert.equal(afterFocus.replacesText, true);
+  await computer.execute(turn, 'COMPUTER_TYPE', afterFocus);
+  const typedOn = await computer.prepare(turn, 'COMPUTER_TYPE', {
+    ref: '@sfind001:e1',
+    text: ' and more',
+  });
+  assert.equal(typedOn.replacesText, false);
+  await computer.execute(turn, 'COMPUTER_TYPE', typedOn);
+  assert.equal(calls.at(-1)?.keepFocus, true);
+  delete findings[0]!.states;
   const renamed = await computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@sdraft01:e1' });
   window.children[0]!.name = 'Delete';
   await assert.rejects(computer.execute(turn, 'COMPUTER_PRESS', renamed), /control changed/);

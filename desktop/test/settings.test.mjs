@@ -11337,6 +11337,7 @@ test('computer use clicks a field that ignores accessibility focus and types or 
     'focus @s1abcdef:e1': { ok: true, data: { disposition: { delivery: 'delivered_unverified' } } },
     'snapshot --root @s1abcdef:e1 --max-depth 0': [
       fieldRead([]),
+      fieldRead([]),
       fieldRead(focused ? ['focused'] : []),
     ],
     ...extra,
@@ -11356,6 +11357,7 @@ test('computer use clicks a field that ignores accessibility focus and types or 
     'type @s1abcdef:e1 --stdin',
     'focus-window --app Mail --window-id w-1',
     'type @s1abcdef:e1 --stdin',
+    focusRead,
     'focus @s1abcdef:e1',
     focusRead,
     'click @s1abcdef:e1 --headed',
@@ -11363,6 +11365,30 @@ test('computer use clicks a field that ignores accessibility focus and types or 
     'find --app Mail --window-id w-1 --state focused --limit 0 --timeout-ms 25000',
     'type @s1abcdef:e1 --stdin --headed',
   ]);
+
+  const keptFocus = await fakeDesktop(
+    t,
+    answers(true, { 'snapshot --root @s1abcdef:e1 --max-depth 0': fieldRead(['focused']) }),
+  );
+  await keptFocus.helper.request(request);
+  assert.ok(!(await keptFocus.calls()).some((call) => /^(focus|click) @s1abcdef:e1/.test(call)));
+
+  const changedWindow = await fakeDesktop(
+    t,
+    answers(true, { 'snapshot --root @s1abcdef:e1 --max-depth 0': fieldRead(['focused']) }),
+  );
+  await assert.rejects(
+    changedWindow.helper.request({ ...request, settable: false, expected: 'checked-state' }),
+  );
+  assert.ok(!(await changedWindow.calls()).some((call) => call.startsWith('press cmd+v')));
+
+  const lostFocus = await fakeDesktop(t, answers(true));
+  await assert.rejects(
+    lostFocus.helper.request({ ...request, keepFocus: true }),
+    /lost keyboard focus/,
+  );
+  assert.ok(!(await lostFocus.calls()).some((call) => /^(focus|click) @s1abcdef:e1/.test(call)));
+  assert.ok(!(await lostFocus.calls()).includes('type @s1abcdef:e1 --stdin --headed'));
 
   const unfocused = await fakeDesktop(t, answers(false));
   await assert.rejects(unfocused.helper.request(request), /did not take keyboard focus/);
@@ -11373,6 +11399,7 @@ test('computer use clicks a field that ignores accessibility focus and types or 
   await pasted.helper.request(readOnly);
   assert.deepEqual(await pasted.calls(), [
     'focus-window --app Mail --window-id w-1',
+    focusRead,
     'focus @s1abcdef:e1',
     focusRead,
     'click @s1abcdef:e1 --headed',
@@ -11411,6 +11438,7 @@ test('computer use clicks a field that ignores accessibility focus and types or 
   assert.deepEqual(await windows.calls(), [
     'focus-window --app Mail --window-id w-1',
     'type @s1abcdef:e1 --stdin --headed',
+    focusRead,
     'focus @s1abcdef:e1 --headed',
     focusRead,
     'click @s1abcdef:e1 --headed',
