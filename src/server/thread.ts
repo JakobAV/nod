@@ -187,6 +187,21 @@ const burstCoalesceMs = (() => {
     : 900;
 })();
 
+const delayedDrains = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleDelayedWake(threadId: string, startAfter: Date) {
+  const delay = Math.max(0, startAfter.getTime() - Date.now()) + 15;
+  if (delay > 10_000) return;
+  const previous = delayedDrains.get(threadId);
+  if (previous) clearTimeout(previous);
+  const timer = setTimeout(() => {
+    if (delayedDrains.get(threadId) === timer) delayedDrains.delete(threadId);
+    if (drainWorker && !stopping) boss.notifyWorker(drainWorker);
+  }, delay);
+  timer.unref();
+  delayedDrains.set(threadId, timer);
+}
+
 export type TurnSource = 'user' | 'schedule' | 'event' | 'resume' | 'task';
 export const ownerStarted = (turn = 'u') => `${turn}.source IN ('user','task','resume')`;
 export interface TurnRef {
@@ -451,6 +466,7 @@ async function sendDrain(client: PoolClient | undefined, threadId: string, start
     },
   );
   if (!startAfter) afterCommit(client ?? {}, () => drainWorker && boss.notifyWorker(drainWorker));
+  else afterCommit(client ?? {}, () => scheduleDelayedWake(threadId, startAfter));
 }
 
 async function insertEvent(
@@ -3348,6 +3364,8 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
 
 export async function stopThreadWorkers() {
   stopping = true;
+  for (const timer of delayedDrains.values()) clearTimeout(timer);
+  delayedDrains.clear();
   cancelTurnOperations();
   for (const controller of running.values()) controller.abort();
   await boss.stop({ graceful: true, timeout: 5000 });
