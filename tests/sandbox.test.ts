@@ -2634,7 +2634,8 @@ test('computer use on macOS tells an app from its same-named helper processes by
       await computer.prepare(turn, 'COMPUTER_OPEN', { bundle: mail.bundle }),
     )) as { pid: number };
   await assert.rejects(open(), /More than one running app matches Thunderbird/);
-  apps = [mail, { pid: 2230, bundle: 'com.example.other', name: mail.bundle }];
+  const namedLikeTheBundle = { pid: 2230, bundle: 'com.example.other', name: mail.bundle };
+  apps = [mail, namedLikeTheBundle];
   await assert.rejects(open(), /More than one running app matches Thunderbird/);
 
   apps = [mail, ...helpers];
