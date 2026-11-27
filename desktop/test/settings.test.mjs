@@ -595,6 +595,7 @@ async function runningDesktop(
     trustCertificates = () => {},
     version = '0.0.0-test',
     argv = [],
+    onBattery = () => false,
     prompt = () => assert.fail('No restart prompt is needed.'),
     reveal = () => assert.fail('No file should be revealed.'),
     openExternal,
@@ -637,6 +638,7 @@ async function runningDesktop(
   const externalURLs = [];
   const trashed = [];
   const blockers = new Map();
+  const systemHolds = [];
   let blockerId = 0;
   const updateMenu = {};
   const restartMenu = {};
@@ -887,6 +889,11 @@ async function runningDesktop(
       }
     },
     clipboard: { writeText: (text) => clipboardText.push(text) },
+    powerMonitor: { isOnBatteryPower: () => onBattery() },
+    createSystemAwake: () => ({
+      set: (hold) => systemHolds.push(hold),
+      close: () => systemHolds.push('closed'),
+    }),
     powerSaveBlocker: {
       start: (type) => {
         blockers.set(++blockerId, type);
@@ -1060,6 +1067,10 @@ async function runningDesktop(
         this.focused = false;
         this.emit('closed');
       }
+      close() {
+        this.emit('close');
+        this.destroy();
+      }
     },
   };
   const source = (await readFile(new URL('../main/main.mjs', import.meta.url), 'utf8'))
@@ -1146,6 +1157,12 @@ async function runningDesktop(
       requestQuit: () => app.quit(),
       restartForUpdate,
       crash: () => { engine = undefined; enginePreferencesReady = false; },
+      checkWaiting,
+      holdAwake,
+      turnOff,
+      closeApp,
+      updateWhenIdle,
+      setUpdates: (updater) => { updates = updater; },
     };
     })()`,
     context,
@@ -1166,6 +1183,7 @@ async function runningDesktop(
     externalURLs,
     trashed,
     awake: () => [...blockers.values()],
+    systemHolds,
     rendererReady,
     healthWaits: () => healthWaits,
     updateMenu,
@@ -4618,8 +4636,9 @@ test('native notification confirmation follows only successful owned enable tran
   }
 });
 
-test('an engine crash retires every stale chat window before recovery opens the new engine', async (t) => {
+test('a crashed engine restarts by itself with backoff and repeated crashes wait for an explicit retry', async (t) => {
   const requests = [];
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const f = await runningDesktop(
     t,
     async (url) => {
@@ -4629,23 +4648,54 @@ test('an engine crash retires every stale chat window before recovery opens the 
     },
     { allowStart: true },
   );
+  const settled = async (promise = f.settle()) => {
+    let done = false;
+    const finish = () => {
+      done = true;
+    };
+    promise.then(finish, finish);
+    while (!done) {
+      t.mock.timers.tick(1);
+      await new Promise(setImmediate);
+    }
+    return promise;
+  };
   f.crash();
-  assert.equal((await f.prepare()).phase, 'ready');
+  assert.equal((await settled(f.prepare())).phase, 'ready');
   f.showEngine();
   const previous = f.windows.at(-1);
   const secondary = new previous.constructor();
   previous.webContents.emit('did-create-window', secondary);
-  f.children[0].emit('exit', 1);
-  assert.equal(f.status().phase, 'error');
+  for (const [index, delay] of [2_000, 15_000, 60_000].entries()) {
+    f.children.at(-1).emit('exit', 1);
+    assert.equal(f.status().phase, 'starting');
+    assert.equal(f.children.length, index + 1);
+    for (let turn = 0; turn < 1000 && !f.windows.at(-1).isVisible(); turn++)
+      await new Promise(setImmediate);
+    t.mock.timers.tick(delay - 1);
+    await new Promise(setImmediate);
+    assert.equal(f.children.length, index + 1);
+    t.mock.timers.tick(1);
+    await settled();
+    assert.equal(f.status().phase, 'ready');
+    assert.equal(f.children.length, index + 2);
+  }
   assert.equal(previous.isDestroyed(), true);
   assert.equal(secondary.isDestroyed(), true);
-  assert.equal((await f.prepare({ retry: true })).phase, 'ready');
+  f.children.at(-1).emit('exit', 1);
+  assert.equal(f.status().phase, 'error');
+  for (let turn = 0; turn < 1000 && !f.windows.at(-1).isVisible(); turn++)
+    await new Promise(setImmediate);
+  t.mock.timers.tick(10 * 60_000);
+  await settled();
+  assert.equal(f.children.length, 4);
+  assert.equal((await settled(f.prepare({ retry: true }))).phase, 'ready');
   f.showEngine();
   const current = f.windows.at(-1);
   assert.notEqual(current, previous);
   assert.equal(current.isDestroyed(), false);
   assert.equal(current.url, new URL(requests.at(-1)).origin);
-  assert.equal(f.children.length, 2);
+  assert.equal(f.children.length, 5);
 });
 
 test('the engine token waits for the engine Nod started to report its port', async (t) => {
@@ -4979,6 +5029,225 @@ test('quitting releases the computer at once and a late working message cannot t
   assert.deepEqual(f.awake(), []);
   f.crash();
   await quitting;
+});
+
+test('the computer stays awake for an upcoming run or phone channel only on power and while the setting is on', async (t) => {
+  for (const platform of ['darwin', 'win32'])
+    await t.test(platform, async (t) => {
+      let upcoming = { running: [], next: null, channels: [] };
+      let battery = false;
+      const f = await runningDesktop(
+        t,
+        async (url) =>
+          Response.json(new URL(url).pathname === '/api/desktop/status' ? upcoming : { ok: true }),
+        { allowStart: true, onBattery: () => battery, platform },
+      );
+      const awake = (held) => {
+        assert.deepEqual(f.awake(), held ? ['prevent-app-suspension'] : []);
+        assert.equal(f.systemHolds.at(-1) ?? false, platform === 'win32' && held);
+      };
+      f.crash();
+      assert.equal((await f.prepare()).phase, 'ready');
+      await f.checkWaiting();
+      awake(false);
+      upcoming = {
+        running: [],
+        next: { title: 'Synthetic briefing', at: new Date(Date.now() + 3_600_000).toISOString() },
+        channels: [],
+      };
+      await f.checkWaiting();
+      awake(true);
+      battery = true;
+      f.holdAwake();
+      awake(false);
+      battery = false;
+      upcoming = { running: [], next: null, channels: ['telegram'] };
+      await f.checkWaiting();
+      awake(true);
+      f.showEngine();
+      const window = f.windows.at(-1);
+      const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+      await f.handlers.get('nod:preferences:save')(event, { keepAwake: false });
+      assert.equal((await f.storage.reopen().get()).keepAwake, false);
+      awake(false);
+      f.children[0].emit('message', { type: 'nod-working', working: true });
+      awake(true);
+      f.children[0].emit('message', { type: 'nod-working', working: false });
+      await f.handlers.get('nod:preferences:save')(event, { keepAwake: true });
+      awake(true);
+      const quitting = f.quit(async () => {});
+      assert.deepEqual(f.awake(), []);
+      f.crash();
+      await quitting;
+      assert.equal(f.systemHolds.includes('closed'), platform === 'win32');
+      assert.equal(f.systemHolds.filter((hold) => hold !== 'closed').at(-1) ?? false, false);
+    });
+});
+
+test(
+  'Windows keep-awake helper holds a system power request until Nod releases it',
+  { skip: process.platform !== 'win32' },
+  async () => {
+    const { createSystemAwake } = await import('../main/system-awake.mjs');
+    const failures = [];
+    const helper = createSystemAwake({ onFailure: (reason) => failures.push(reason) });
+    const reason = 'Nod is keeping this computer awake for its work and schedules';
+    const listed = async () => {
+      const { stdout } = await promisify(execFile)('powercfg.exe', ['/requests']);
+      const system = /SYSTEM:\r?\n([\s\S]*?)(?:\r?\n\r?\n|$)/.exec(stdout)?.[1] ?? '';
+      return system.includes(reason);
+    };
+    const until = async (expected) => {
+      for (let attempt = 0; attempt < 120 && (await listed()) !== expected; attempt++)
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      return listed();
+    };
+    try {
+      helper.set(true);
+      assert.equal(await until(true), true);
+      helper.set(false);
+      assert.equal(await until(false), false);
+      helper.set(true);
+      assert.equal(await until(true), true);
+    } finally {
+      helper.close();
+    }
+    assert.equal(await until(false), false);
+    assert.deepEqual(failures, []);
+  },
+);
+
+test('closing the app leaves Nod on and turning it off names what stops first', async (t) => {
+  const prompts = [];
+  let answer = 1;
+  let upcoming = { running: [], next: null, channels: [] };
+  let unavailable = false;
+  const f = await runningDesktop(
+    t,
+    async (url) =>
+      new URL(url).pathname !== '/api/desktop/status'
+        ? Response.json({ ok: true })
+        : unavailable
+          ? new Response('Synthetic failure', { status: 500 })
+          : Response.json(upcoming),
+    {
+      allowStart: true,
+      prompt: (value) => {
+        prompts.push(value);
+        return { response: answer };
+      },
+    },
+  );
+  f.crash();
+  assert.equal((await f.prepare()).phase, 'ready');
+  f.showEngine();
+  const window = f.windows.at(-1);
+  f.closeApp();
+  assert.equal(window.isDestroyed(), true);
+  assert.equal(f.children[0].killed, undefined);
+  assert.equal(f.status().phase, 'ready');
+  upcoming = {
+    running: [{ source: 'schedule', visible: false, task: false }],
+    next: { title: 'Synthetic briefing', at: new Date(Date.now() + 3_600_000).toISOString() },
+    channels: ['telegram'],
+  };
+  await f.turnOff();
+  assert.equal(prompts.length, 1);
+  for (const named of ['a scheduled task', 'Synthetic briefing', 'Telegram'])
+    assert.ok(prompts[0].detail.includes(named), named);
+  assert.equal(f.children[0].killed, undefined);
+  unavailable = true;
+  await f.turnOff();
+  assert.equal(prompts.length, 2);
+  assert.ok(prompts[1].detail.includes('could not check'));
+  assert.equal(f.children[0].killed, undefined);
+  unavailable = false;
+  upcoming = { running: [], next: null, channels: [] };
+  answer = 0;
+  await f.turnOff();
+  assert.equal(prompts.length, 2);
+  for (let turn = 0; !f.children[0].killed && turn < 1000; turn++)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(f.children[0].killed, true);
+});
+
+test('a login launch starts a set-up Nod without a window and a second login launch stays hidden', async (t) => {
+  for (const argv of [[], ['--background']]) {
+    const f = await runningDesktop(t, async () => Response.json({ ok: true }), {
+      platform: 'win32',
+      initialState: 'upgrade',
+      allowStart: true,
+      argv,
+    });
+    t.after(() => f.close());
+    const open = () => f.windows.filter((window) => !window.isDestroyed()).length;
+    await f.launch();
+    await f.settle();
+    assert.equal(f.status().phase, 'ready');
+    assert.equal(f.children.length, 1);
+    assert.equal(open(), argv.length ? 0 : 1);
+    f.secondInstance(['--background']);
+    assert.equal(open(), argv.length ? 0 : 1);
+    f.secondInstance([]);
+    assert.equal(open(), 1);
+    await f.close();
+  }
+});
+
+test('a ready update installs by itself only when Nod is idle, closed and no run is due soon', async (t) => {
+  const installs = [];
+  let upcoming = {
+    running: [{ source: 'schedule', visible: false, task: false }],
+    next: null,
+    channels: [],
+  };
+  let unavailable = false;
+  const f = await runningDesktop(
+    t,
+    async (url) =>
+      new URL(url).pathname !== '/api/desktop/status'
+        ? Response.json({ ok: true })
+        : unavailable
+          ? new Response('Synthetic failure', { status: 500 })
+          : Response.json(upcoming),
+    {
+      platform: 'win32',
+      allowStart: true,
+      startWindowsInstall: async (options) => installs.push(options.relaunch),
+    },
+  );
+  t.after(() => f.close());
+  f.crash();
+  assert.equal((await f.prepare()).phase, 'ready');
+  f.setUpdates({ ready: { version: '0.10.2' }, dispose: async () => {} });
+  const idle = async () => {
+    await f.updateWhenIdle(await f.checkWaiting());
+  };
+  await idle();
+  upcoming = {
+    running: [],
+    next: { title: 'Synthetic briefing', at: new Date(Date.now() + 10 * 60_000).toISOString() },
+    channels: [],
+  };
+  await idle();
+  upcoming = {
+    running: [],
+    next: { title: 'Synthetic briefing', at: new Date(Date.now() + 3_600_000).toISOString() },
+    channels: [],
+  };
+  f.showEngine();
+  await idle();
+  assert.deepEqual(installs, []);
+  f.windows.at(-1).close();
+  unavailable = true;
+  await idle();
+  assert.deepEqual(installs, []);
+  unavailable = false;
+  await idle();
+  assert.deepEqual(installs, [true]);
+  const resume = JSON.parse(await readFile(join(f.profileRoot, 'update-resume.json'), 'utf8'));
+  assert.equal(resume.hidden, true);
+  assert.equal(resume.version, '0.10.2');
 });
 
 async function fixture(t, platform = 'win32') {
@@ -6158,6 +6427,7 @@ app.whenReady().then(async () => {
       launchAtLogin: true,
       notifications: false,
       notificationSound: false,
+      keepAwake: true,
       theme: 'system',
       zoomFactor: 1,
       onboardingPreferenceStep: 'complete',
