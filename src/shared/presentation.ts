@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { appPagePath, appPageUrl } from './app-links.ts';
-import { previewableUrl } from './link-preview.ts';
+import { previewableUrl, publicActionUrl } from './link-preview.ts';
 
 const text = (length: number) =>
   z
@@ -15,13 +15,11 @@ const url = text(2048)
   })
   .transform((value) => previewableUrl(value)!);
 const actionUrl = text(2048)
-  .refine(
-    (value) => Boolean(appPagePath(value.trim()) || previewableUrl(value)?.startsWith('https://')),
-    {
-      message: 'Use a public HTTPS link or an allowed Nod page path.',
-    },
-  )
-  .transform((value) => appPagePath(value.trim()) ?? previewableUrl(value)!);
+  .refine((value) => Boolean(appPagePath(value.trim()) || publicActionUrl(value.trim())), {
+    message:
+      'Use a public HTTPS link without credentials, auth paths or sensitive query tokens, or an allowed Nod page path.',
+  })
+  .transform((value) => appPagePath(value.trim()) ?? publicActionUrl(value.trim())!);
 const common = {
   version: z.literal(1),
   title: text(120),

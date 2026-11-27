@@ -1555,10 +1555,29 @@ test('facts presentations validate references, copyable items, and public HTTPS 
     /Open Scheduled: https:\/\/nod\.n8n\.io\/docs\/open\/#\/tasks/,
   );
 
+  const hashAndConfirmActions = [
+    'https://shop.example.com/#/orders/123',
+    'https://tables.example.com/confirm/TB-5529',
+    'https://events.example.com/verify/42?ticket=T-99&booking_code=BK-12',
+  ];
+  for (const href of hashAndConfirmActions) {
+    const ok = presentationInputSchema.parse({
+      version: 1,
+      type: 'facts',
+      title: 'Order confirmed',
+      sources: [],
+      action: { label: 'View order', url: href },
+    });
+    assert.equal(ok.type, 'facts');
+    assert.equal(ok.action?.url, href);
+  }
+
   for (const bad of [
     { ...receipt, action: { url: 'http://shop.example.com/cart' } },
     { ...receipt, action: { url: 'https://localhost/cart' } },
+    { ...receipt, action: { url: 'https://user:pass@shop.example.com/cart' } },
     { ...receipt, action: { url: 'https://shop.example.com/cart?token=secret123' } },
+    { ...receipt, action: { url: 'https://shop.example.com/reset-password/abc' } },
     { ...receipt, action: { url: '/api/artifacts/secret' } },
     { ...receipt, action: { url: '/browser' } },
     { ...receipt, reference: { label: 'Ref', value: '   ' } },

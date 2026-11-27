@@ -18,7 +18,7 @@ import {
   type Presentation,
 } from '../shared/presentation.ts';
 import { appPagePath } from '../shared/app-links.ts';
-import { previewableUrl } from '../shared/link-preview.ts';
+import { previewableUrl, publicActionUrl } from '../shared/link-preview.ts';
 import { proactiveUpdateSchema, sourceReadSchema } from '../shared/proactivity.ts';
 import { Value } from '@sinclair/typebox/value';
 import {
@@ -259,12 +259,11 @@ const safeHttpsUrl = (value: unknown) =>
     : undefined;
 const safeActionUrl = (value: unknown) => {
   if (typeof value !== 'string') return undefined;
-  const appPath = appPagePath(value.trim());
-  if (appPath) return appPath;
-  return safeHttpsUrl(value);
+  const trimmed = value.trim();
+  return appPagePath(trimmed) ?? publicActionUrl(trimmed) ?? undefined;
 };
 const internalApiPathPattern = /^\/api(?:\/|$)/i;
-const normalizePresentationInput = (value: unknown) => {
+export const normalizePresentationInput = (value: unknown) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   const record = { ...(value as Record<string, unknown>) };
   if (!('sources' in record)) record.sources = [];
@@ -300,29 +299,25 @@ const normalizePresentationInput = (value: unknown) => {
   }
   if (record.type === 'facts' && 'action' in record) {
     if (typeof record.action === 'string') {
-      const safe = safeActionUrl(record.action);
-      if (safe) record.action = { url: safe };
-      else delete record.action;
+      const trimmed = record.action.trim();
+      const safe = safeActionUrl(trimmed);
+      record.action = { url: safe ?? trimmed };
     } else if (
       record.action &&
       typeof record.action === 'object' &&
       !Array.isArray(record.action)
     ) {
       const action = { ...(record.action as Record<string, unknown>) };
-      const safe = safeActionUrl(action.url);
-      if (!safe) {
-        delete record.action;
-      } else {
-        action.url = safe;
-        if (typeof action.label === 'string') {
-          const trimmed = action.label.trim();
-          if (trimmed) action.label = clip(trimmed, 60);
-          else delete action.label;
-        }
-        record.action = action;
+      if (typeof action.url === 'string') {
+        const trimmed = action.url.trim();
+        action.url = safeActionUrl(trimmed) ?? trimmed;
       }
-    } else {
-      delete record.action;
+      if (typeof action.label === 'string') {
+        const trimmed = action.label.trim();
+        if (trimmed) action.label = clip(trimmed, 60);
+        else delete action.label;
+      }
+      record.action = action;
     }
   }
   if (typeof record.note === 'string') record.note = clip(record.note.trim(), 220);
@@ -359,8 +354,9 @@ const normalizePresentationInput = (value: unknown) => {
       const actionHref =
         record.action &&
         typeof record.action === 'object' &&
+        !Array.isArray(record.action) &&
         typeof (record.action as { url?: unknown }).url === 'string'
-          ? (record.action as { url: string }).url.trim().toLowerCase()
+          ? safeActionUrl((record.action as { url: string }).url)?.toLowerCase()
           : undefined;
       record.items = (record.items as unknown[]).filter((entry) => {
         if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return true;
@@ -369,7 +365,11 @@ const normalizePresentationInput = (value: unknown) => {
         const trimmed = val.trim();
         const lower = trimmed.toLowerCase();
         if (refValue && lower === refValue) return false;
-        if (actionHref && lower === actionHref) return false;
+        if (
+          actionHref &&
+          (lower === actionHref || safeActionUrl(trimmed)?.toLowerCase() === actionHref)
+        )
+          return false;
         if (internalApiPathPattern.test(trimmed)) return false;
         return true;
       });
