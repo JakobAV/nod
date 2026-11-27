@@ -4416,7 +4416,62 @@ test('send_message validates structured visuals and delivers each distinct prese
                 title: 'Synthetic invoice',
                 caption: 'c'.repeat(500),
                 status: 'Pending approval',
-                items: [{ label: 'Total', value: '€10' }],
+                reference: { label: 'Confirmation', value: 'TB-5529' },
+                items: [
+                  { label: 'Confirmation', value: 'tb-5529' },
+                  { label: 'Total', value: '€10', strong: true },
+                  { label: 'Link', value: 'https://tables.example.com/#/bookings/TB-5529' },
+                  { label: 'Raw', value: '/api/artifacts/internal-id' },
+                ],
+                action: {
+                  label: 'View booking',
+                  url: 'https://tables.example.com/#/bookings/TB-5529',
+                },
+              },
+            });
+            await assert.rejects(
+              () =>
+                send.execute({
+                  text: '',
+                  presentation: {
+                    version: 1,
+                    type: 'facts',
+                    title: 'Synthetic cart',
+                    status: 'Ready',
+                    items: [{ label: 'Items', value: '12', copy: true }],
+                    action: {
+                      label: 'Unsafe link',
+                      url: 'http://127.0.0.1/cart',
+                    },
+                  },
+                }),
+              /Use a public HTTPS link/,
+            );
+            await assert.rejects(
+              () =>
+                send.execute({
+                  text: '',
+                  presentation: {
+                    version: 1,
+                    type: 'facts',
+                    title: 'Overlong reference',
+                    reference: { label: 'Confirmation', value: 'R'.repeat(81) },
+                  },
+                }),
+              /80/,
+            );
+            await send.execute({
+              text: '',
+              presentation: {
+                version: 1,
+                type: 'facts',
+                title: 'Synthetic schedule',
+                status: 'Active',
+                items: [{ label: 'Cadence', value: 'Weekdays 08:30', copy: true }],
+                action: {
+                  label: 'Open Scheduled',
+                  url: '/tasks',
+                },
               },
             });
           },
@@ -4435,7 +4490,7 @@ test('send_message validates structured visuals and delivers each distinct prese
       },
     });
     assert.equal(result.status, 'succeeded');
-    assert.equal(replies.length, 2);
+    assert.equal(replies.length, 3);
     assert.equal(replies[0][3]?.type, 'draft');
     if (replies[0][3]?.type === 'draft') {
       assert.equal(replies[0][3].status, 'draft');
@@ -4444,6 +4499,17 @@ test('send_message validates structured visuals and delivers each distinct prese
     if (replies[1][3]?.type === 'facts') {
       assert.deepEqual(replies[1][3].status, { label: 'Pending approval', tone: 'waiting' });
       assert.equal(replies[1][3].caption?.length, 500);
+      assert.deepEqual(replies[1][3].reference, { label: 'Confirmation', value: 'TB-5529' });
+      assert.deepEqual(replies[1][3].items, [{ label: 'Total', value: '€10', strong: true }]);
+      assert.deepEqual(replies[1][3].action, {
+        label: 'View booking',
+        url: 'https://tables.example.com/#/bookings/TB-5529',
+      });
+    }
+    assert.equal(replies[2][3]?.type, 'facts');
+    if (replies[2][3]?.type === 'facts') {
+      assert.equal(replies[2][3].items?.[0]?.copy, true);
+      assert.deepEqual(replies[2][3].action, { label: 'Open Scheduled', url: '/tasks' });
     }
   });
 

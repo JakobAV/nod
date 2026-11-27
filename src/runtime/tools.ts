@@ -17,7 +17,8 @@ import {
   presentationSchema,
   type Presentation,
 } from '../shared/presentation.ts';
-import { previewableUrl } from '../shared/link-preview.ts';
+import { appPagePath } from '../shared/app-links.ts';
+import { previewableUrl, publicActionUrl } from '../shared/link-preview.ts';
 import { proactiveUpdateSchema, sourceReadSchema } from '../shared/proactivity.ts';
 import { Value } from '@sinclair/typebox/value';
 import {
@@ -256,7 +257,13 @@ const safeHttpsUrl = (value: unknown) =>
   typeof value === 'string' && Boolean(previewableUrl(value)?.startsWith('https://'))
     ? value
     : undefined;
-const normalizePresentationInput = (value: unknown) => {
+const safeActionUrl = (value: unknown) => {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return appPagePath(trimmed) ?? publicActionUrl(trimmed) ?? undefined;
+};
+const internalApiPathPattern = /^\/api(?:\/|$)/i;
+export const normalizePresentationInput = (value: unknown) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   const record = { ...(value as Record<string, unknown>) };
   if (!('sources' in record)) record.sources = [];
@@ -284,6 +291,35 @@ const normalizePresentationInput = (value: unknown) => {
     if (coerced) record.status = coerced;
     else delete record.status;
   }
+  if (record.type === 'facts' && record.reference && typeof record.reference === 'object') {
+    const reference = { ...(record.reference as Record<string, unknown>) };
+    if (typeof reference.label === 'string') reference.label = clip(reference.label.trim(), 40);
+    if (typeof reference.value === 'string') reference.value = reference.value.trim();
+    record.reference = reference;
+  }
+  if (record.type === 'facts' && 'action' in record) {
+    if (typeof record.action === 'string') {
+      const trimmed = record.action.trim();
+      const safe = safeActionUrl(trimmed);
+      record.action = { url: safe ?? trimmed };
+    } else if (
+      record.action &&
+      typeof record.action === 'object' &&
+      !Array.isArray(record.action)
+    ) {
+      const action = { ...(record.action as Record<string, unknown>) };
+      if (typeof action.url === 'string') {
+        const trimmed = action.url.trim();
+        action.url = safeActionUrl(trimmed) ?? trimmed;
+      }
+      if (typeof action.label === 'string') {
+        const trimmed = action.label.trim();
+        if (trimmed) action.label = clip(trimmed, 60);
+        else delete action.label;
+      }
+      record.action = action;
+    }
+  }
   if (typeof record.note === 'string') record.note = clip(record.note.trim(), 220);
   if (typeof record.verdict === 'string') record.verdict = clip(record.verdict.trim(), 240);
   if (Array.isArray(record.items)) {
@@ -308,6 +344,36 @@ const normalizePresentationInput = (value: unknown) => {
       if ('url' in item && !safeHttpsUrl(item.url)) delete item.url;
       return item;
     });
+    if (record.type === 'facts') {
+      const refValue =
+        record.reference &&
+        typeof record.reference === 'object' &&
+        typeof (record.reference as { value?: unknown }).value === 'string'
+          ? (record.reference as { value: string }).value.trim().toLowerCase()
+          : undefined;
+      const actionHref =
+        record.action &&
+        typeof record.action === 'object' &&
+        !Array.isArray(record.action) &&
+        typeof (record.action as { url?: unknown }).url === 'string'
+          ? safeActionUrl((record.action as { url: string }).url)?.toLowerCase()
+          : undefined;
+      record.items = (record.items as unknown[]).filter((entry) => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return true;
+        const val = (entry as { value?: unknown }).value;
+        if (typeof val !== 'string') return true;
+        const trimmed = val.trim();
+        const lower = trimmed.toLowerCase();
+        if (refValue && lower === refValue) return false;
+        if (
+          actionHref &&
+          (lower === actionHref || safeActionUrl(trimmed)?.toLowerCase() === actionHref)
+        )
+          return false;
+        if (internalApiPathPattern.test(trimmed)) return false;
+        return true;
+      });
+    }
   }
   return record;
 };
