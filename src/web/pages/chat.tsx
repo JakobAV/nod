@@ -988,7 +988,7 @@ export function Chat({
       return;
     }
   });
-  const cardOptionTexts = new Map<string, Set<string>>();
+  const openCardIds = new Set<string>();
   for (const message of visibleMessages) {
     if (
       message.role !== 'assistant' ||
@@ -996,14 +996,7 @@ export function Chat({
       presentationPick(message.presentation)
     )
       continue;
-    const choices = presentationChoices(message.presentation);
-    if (choices.length)
-      cardOptionTexts.set(
-        message.id,
-        new Set(
-          choices.map((choice, index) => choiceAnswerText([{ ...choice, id: String(index) }])),
-        ),
-      );
+    if (presentationChoices(message.presentation).length) openCardIds.add(message.id);
   }
   const cardChoices = new Map<string, string>();
   for (const message of visibleMessages)
@@ -1011,7 +1004,7 @@ export function Chat({
       message.role === 'user' &&
       message.replyTo?.role === 'assistant' &&
       !cardChoices.has(message.replyTo.id) &&
-      cardOptionTexts.get(message.replyTo.id)?.has(message.text)
+      openCardIds.has(message.replyTo.id)
     )
       cardChoices.set(message.replyTo.id, message.text);
   const lastOwnerIndex = visibleMessages.findLastIndex((message) => message.role === 'user');

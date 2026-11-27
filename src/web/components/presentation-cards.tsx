@@ -16,10 +16,10 @@ export interface CardPick {
   disabled: boolean;
   sent: boolean;
   closed?: boolean;
-  label?: string;
   choose(index: number): void;
   write(text: string): void;
   send(fallback?: string): void;
+  skip(): void;
 }
 
 export const CardPickContext = createContext<CardPick | null>(null);
@@ -76,45 +76,54 @@ export function CardPickSend({
   const send = () => {
     if (!idle) pick.send(written || pick.chosen.length ? undefined : action?.label);
   };
+  const skip = () => {
+    if (open && !pick.disabled) pick.skip();
+  };
   return (
     <div className="card-band card-pick-send">
-      {open && (
-        <>
-          <input
-            className="card-pick-write"
-            value={pick.written}
-            maxLength={4000}
-            placeholder={placeholder}
-            aria-label={placeholder}
-            readOnly={pick.disabled}
-            onChange={(event) => pick.write(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key !== 'Enter' || event.nativeEvent.isComposing) return;
-              event.preventDefault();
-              send();
-            }}
-          />
-          <button
-            type="button"
-            className="choice-card-done"
-            aria-disabled={idle || undefined}
-            onClick={send}
-          >
-            {written || pick.multiple ? (
-              'Send'
-            ) : action ? (
-              <>
-                {action.icon}
-                {action.label}
-              </>
-            ) : pick.label ? (
-              `Choose ${pick.label}`
-            ) : (
-              'Choose one'
-            )}
-          </button>
-        </>
-      )}
+      <div className="card-pick-bar">
+        {open && (
+          <>
+            <input
+              className="card-pick-write"
+              value={pick.written}
+              maxLength={4000}
+              placeholder={placeholder}
+              aria-label={placeholder}
+              readOnly={pick.disabled}
+              onChange={(event) => pick.write(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== 'Enter' || event.nativeEvent.isComposing) return;
+                event.preventDefault();
+                send();
+              }}
+            />
+            <button
+              type="button"
+              className="choice-card-skip"
+              aria-disabled={pick.disabled || undefined}
+              onClick={skip}
+            >
+              Skip
+            </button>
+            <button
+              type="button"
+              className="choice-card-done"
+              aria-disabled={idle || undefined}
+              onClick={send}
+            >
+              {action && !written && !pick.multiple && !pick.chosen.length ? (
+                <>
+                  {action.icon}
+                  {action.label}
+                </>
+              ) : (
+                'Send'
+              )}
+            </button>
+          </>
+        )}
+      </div>
       {extra}
     </div>
   );

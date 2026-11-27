@@ -491,7 +491,7 @@ export function MessageBubble({
   const openChosen = openChoices.findIndex(
     (choice) => chosenText !== undefined && choiceAnswerText([choice]) === chosenText,
   );
-  const openAnswered = openChosen >= 0;
+  const openAnswered = chosenText !== undefined;
   const interactionClosed = Boolean(
     pickQuestion?.interaction &&
     (pickQuestion.interaction.status === 'expired' ||
@@ -511,7 +511,6 @@ export function MessageBubble({
         )
       : [];
   const pickedChoices = picked.map((index) => pickChoices[index]!);
-  const pickedChoice = picked.length === 1 ? pickedChoices[0] : undefined;
   const cardPick: CardPick | null = pickChoices.length
     ? {
         chosen: answered.length ? answered : picked,
@@ -538,12 +537,6 @@ export function MessageBubble({
             !onAnswer ||
             answersDisabled === true ||
             sending,
-        label:
-          pickedChoice &&
-          (pickedChoice.description &&
-          pickChoices.filter((choice) => choice.label === pickedChoice.label).length > 1
-            ? `${pickedChoice.label} ${pickedChoice.description.split(' · ')[0]}`
-            : pickedChoice.label),
         choose(index) {
           if (sending || openAnswered) return;
           setPicked((current) =>
@@ -588,6 +581,32 @@ export function MessageBubble({
               if (result === true) {
                 setWritten('');
                 if (!chosen.length) setPicked([]);
+              } else if (result === 'unavailable') {
+                setGone(true);
+              } else if (result === false) {
+                setError('Your choice could not be sent. Try again.');
+              }
+            },
+            (cause) => {
+              setSending(false);
+              setError(errorMessage(cause));
+            },
+          );
+        },
+        skip() {
+          if (sending || openAnswered || gone) return;
+          const outcome = openChoices.length
+            ? onChoose?.('Skip')
+            : onAnswer?.('Skip', { custom: true });
+          if (!outcome) return;
+          setSending(true);
+          setError('');
+          void outcome.then(
+            (result) => {
+              setSending(false);
+              if (result === true) {
+                setWritten('');
+                setPicked([]);
               } else if (result === 'unavailable') {
                 setGone(true);
               } else if (result === false) {

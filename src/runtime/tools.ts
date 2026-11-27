@@ -436,7 +436,7 @@ export const toolDefinitions = {
   ),
   ask_user: defineTool(
     'ask_user',
-    'Ask one necessary question, ending with a question mark, and pause. Supply choices whenever likely answers exist, normally two to four, even for open details such as dates, budgets or counts: offer the likely values, for example "This weekend" or "Under €150 a night". Each label is one short line that names the option with the detail that tells it apart; add one such as "Decide for me" when you can pick a sensible default. The owner can write another answer. Put assumptions and any answer to earlier messages first, as their own paragraph, and end with the question alone. Never use choices for action approvals or secrets.',
+    'Ask one necessary question, ending with a question mark, and pause. Supply choices whenever likely answers exist, normally two to four (up to six when the user is choosing across several options or combinations), even for open details such as dates, budgets or counts: offer the likely values, for example "This weekend" or "Under €150 a night". When options can be combined (for example multiple targets, channels, or filters), set multiple: true and include a combined option like "Both" or "All of them" when helpful. Each label is one short line that names the option with the detail that tells it apart; add one such as "Decide for me" when you can pick a sensible default. The owner can write another answer. Put assumptions and any answer to earlier messages first, as their own paragraph, and end with the question alone. Never use choices for action approvals or secrets.',
     Type.Object({
       question: Type.String(),
       choices: Type.Optional(
