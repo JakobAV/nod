@@ -11635,6 +11635,27 @@ test('computer use on Windows starts only windowed programs', async (t) => {
   assert.deepEqual(await desktop.calls(), [`launch ${join(root, 'System32', 'notepad.exe')}`]);
 });
 
+test('computer use on macOS reaches an app by bundle ID when helper processes share its name', async (t) => {
+  const desktop = await fakeDesktop(t, {
+    status: { ok: true, data: { supported_surfaces: ['window', 'menubar'] } },
+    'snapshot --app Thunderbird': refused(
+      'AMBIGUOUS_TARGET',
+      "Multiple application instances matched 'Thunderbird'",
+    ),
+    'snapshot --app org.mozilla.thunderbird': {
+      ok: true,
+      data: { tree: { role: 'menubar', children: [{ role: 'menu', name: 'File' }] } },
+    },
+  });
+  const read = await desktop.helper.request({
+    op: 'snapshot',
+    app: 'Thunderbird',
+    bundle: 'org.mozilla.thunderbird',
+    menu: true,
+  });
+  assert.equal(read.tree.children[0].name, 'File');
+});
+
 test('computer use keeps no focus session when the window cannot come to the front', async (t) => {
   const desktop = await fakeDesktop(t, {
     'list-windows': mailWindow,

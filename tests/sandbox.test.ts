@@ -2034,9 +2034,18 @@ test('computer use refuses blocked apps, keeps browsers view-only and acts only 
     'io.n8n.Nod',
   ])
     assert.equal(computerAppRule(bundle).kind, 'blocked', bundle);
-  for (const bundle of ['msedge.exe', 'firefox', 'org.mozilla.firefox', 'code'])
+  for (const bundle of [
+    'msedge.exe',
+    'firefox',
+    'org.mozilla.firefox',
+    'org.mozilla.firefoxdeveloperedition',
+    'org.mozilla.nightly',
+    'org.mozilla.seamonkey',
+    'code',
+  ])
     assert.equal(computerAppRule(bundle).kind, 'view', bundle);
-  assert.equal(computerAppRule('notepad.exe').kind, 'use');
+  for (const bundle of ['notepad.exe', 'org.mozilla.thunderbird'])
+    assert.equal(computerAppRule(bundle).kind, 'use', bundle);
   assert.equal(computerAppRule('C:\\Apps\\Slack\\slack.exe', ['slack']).kind, 'blocked');
   for (const platform of ['win32', 'linux'])
     for (const keys of ['win+r', 'super+a', 'alt+tab', 'ctrl+esc', 'ctrl+alt+t', 'ctrl+alt+delete'])
@@ -2286,6 +2295,7 @@ test('computer use refuses blocked apps, keeps browsers view-only and acts only 
     op: 'press',
     ref: '@sdraft01:e1',
     app: 'TextEdit',
+    bundle: 'com.apple.TextEdit',
     role: 'button',
     control: { role: 'button', name: 'Send' },
     expected: press.windowBinding!.state,
@@ -2298,7 +2308,13 @@ test('computer use refuses blocked apps, keeps browsers view-only and acts only 
   )) as { matches: string };
   assert.match(found.matches, /textfield "Message to Ada" @sfind001:e1/);
   assert.doesNotMatch(found.matches, /@sfind001:e2/);
-  assert.deepEqual(calls.at(-1), { op: 'find', app: 'TextEdit', window: 'w-1', role: 'textfield' });
+  assert.deepEqual(calls.at(-1), {
+    op: 'find',
+    app: 'TextEdit',
+    bundle: 'com.apple.TextEdit',
+    window: 'w-1',
+    role: 'textfield',
+  });
   await assert.rejects(
     computer.prepare(turn, 'COMPUTER_TYPE', { ref: '@sfind001:e2', text: 'x' }),
     /no snapshot with that ref/,
@@ -2642,6 +2658,71 @@ test('turning computer use off cancels input waiting on a read, even if that rea
     release();
     await server.close();
   }
+});
+
+test('computer use on macOS tells an app from its same-named helper processes by bundle ID', async () => {
+  const pool = {
+    query: async (sql: string) => {
+      if (sql.startsWith('SELECT computer_use'))
+        return { rows: [{ computer_use: true, computer_keep_out: [] }] };
+      if (sql.startsWith('WITH RECURSIVE'))
+        return { rows: [{ id: 'root', source: 'user', message_id: 'message', proactive: false }] };
+      assert.fail(`Unexpected query: ${sql}`);
+    },
+  } as unknown as Pool;
+  const mail = {
+    pid: 2211,
+    bundle: 'org.mozilla.thunderbird',
+    name: 'Thunderbird',
+    windows: [{ id: 'w-1', title: 'Inbox' }],
+  };
+  const helpers = [2213, 2214].map((pid) => ({ pid, bundle: 'Thunderbird', name: 'Thunderbird' }));
+  let apps: Array<{ pid: number; bundle: string; name: string; windows?: unknown[] }> = [
+    mail,
+    { ...mail, pid: 2220 },
+  ];
+  let sent: Record<string, unknown> = {};
+  const menu = {
+    role: 'menubar',
+    name: '',
+    children: ['Apple', 'Thunderbird', 'File'].map((name) => ({ role: 'menu', name })),
+  };
+  const computer = createComputerUse(pool, 'owner', {
+    platform: 'darwin',
+    desktop: {
+      request: async (request) => {
+        if (request.op === 'apps') return { apps };
+        if (request.op === 'windows')
+          return { windows: apps.find((item) => item.pid === request.pid)?.windows ?? [] };
+        if (request.op === 'snapshot') {
+          sent = request;
+          return { tree: menu };
+        }
+        return {};
+      },
+    },
+  });
+  const turn = { turnId: 'turn', threadId: 'thread' };
+  const open = async () =>
+    (await computer.execute(
+      turn,
+      'COMPUTER_OPEN',
+      await computer.prepare(turn, 'COMPUTER_OPEN', { bundle: mail.bundle }),
+    )) as { pid: number };
+  await assert.rejects(open(), /More than one running app matches Thunderbird/);
+  const namedLikeTheBundle = { pid: 2230, bundle: 'com.example.other', name: mail.bundle };
+  apps = [mail, namedLikeTheBundle];
+  await assert.rejects(open(), /More than one running app matches Thunderbird/);
+
+  apps = [mail, ...helpers];
+  assert.equal((await open()).pid, mail.pid);
+  const read = (await computer.execute(
+    turn,
+    'COMPUTER_SNAPSHOT',
+    await computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: mail.pid, menu: true }),
+  )) as { tree: string };
+  assert.match(read.tree, /menu "File"/);
+  assert.equal(sent.bundle, mail.bundle);
 });
 
 test('computer use on Windows keeps an opened app granted however the app list names it, and refuses apps it cannot identify', async () => {

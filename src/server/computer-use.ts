@@ -209,7 +209,7 @@ const blockedApps: Array<[RegExp, string]> = [
 ];
 const viewOnlyApps: Array<[RegExp, string]> = [
   [
-    /^(com\.google\.chrome.*|com\.apple\.safari.*|company\.thebrowser\..*|org\.mozilla\..*|com\.microsoft\.edge.*|com\.brave\.browser.*|com\.operasoftware\..*|com\.vivaldi\..*|app\.zen-browser\..*|com\.kagi\..*|ai\.perplexity\..*|com\.openai\.atlas.*|org\.chromium\..*|chrome|google-chrome(-stable|-beta)?|chromium(-browser)?|msedge|microsoft-edge(-stable)?|firefox(-esr)?|brave(-browser)?|opera|vivaldi(-stable)?|arc|librewolf|zen|org\.gnome\.epiphany|epiphany)$/,
+    /^(com\.google\.chrome.*|com\.apple\.safari.*|company\.thebrowser\..*|org\.mozilla\.(?!thunderbird).*|com\.microsoft\.edge.*|com\.brave\.browser.*|com\.operasoftware\..*|com\.vivaldi\..*|app\.zen-browser\..*|com\.kagi\..*|ai\.perplexity\..*|com\.openai\.atlas.*|org\.chromium\..*|chrome|google-chrome(-stable|-beta)?|chromium(-browser)?|msedge|microsoft-edge(-stable)?|firefox(-esr)?|brave(-browser)?|opera|vivaldi(-stable)?|arc|librewolf|zen|org\.gnome\.epiphany|epiphany)$/,
     "a web browser; use Nod's own browser for websites",
   ],
   [
@@ -483,6 +483,7 @@ export function createComputerUse(
       {
         op: 'snapshot',
         app: found.app,
+        bundle: found.bundle,
         ref,
         ...(found.windowId ? { window: found.windowId } : {}),
       },
@@ -496,7 +497,7 @@ export function createComputerUse(
   }
 
   async function windowContext(
-    app: string,
+    app: Identity,
     window: string | undefined,
     signal?: AbortSignal,
     focus = false,
@@ -506,7 +507,8 @@ export function createComputerUse(
     const result = await ask(
       {
         op: 'inspect',
-        app,
+        app: app.name,
+        bundle: app.bundle,
         ...(window ? { window } : {}),
         ...(focus ? { focus: true } : {}),
         ...(menu ? { menu: true } : {}),
@@ -547,7 +549,10 @@ export function createComputerUse(
   }
 
   async function windowsOf(app: App, signal?: AbortSignal): Promise<App> {
-    const { windows } = await ask({ op: 'windows', app: app.name, pid: app.pid }, signal);
+    const { windows } = await ask(
+      { op: 'windows', app: app.name, bundle: app.bundle, pid: app.pid },
+      signal,
+    );
     return { ...app, windows: (windows as Window[]) ?? [] };
   }
 
@@ -594,14 +599,16 @@ export function createComputerUse(
       throw new IntegrationError(`No running app has pid ${processId}. List apps again.`, 404);
     allowed(app, keptOut, acting);
     granted(root, app);
-    unique(apps, app.name);
+    unique(apps, app);
     return windowsOf(app, signal);
   }
 
-  function unique(apps: App[], name: string) {
-    if (apps.filter((item) => item.name === name).length > 1)
+  function unique(apps: App[], app: Identity) {
+    const same = (item: App) =>
+      mac ? sameApp(item, app) || item.name === app.bundle : item.name === app.name;
+    if (apps.filter(same).length > 1)
       throw new IntegrationError(
-        `More than one running app is named ${name}, so Nod can't tell them apart.`,
+        `More than one running app matches ${app.name}, so Nod can't tell them apart.`,
         409,
       );
   }
@@ -669,7 +676,7 @@ export function createComputerUse(
           ? { replacesText: replacesText(action, node, selectedByNod(root, found.bundle)) }
           : {}),
         ...(action !== 'COMPUTER_FOCUS'
-          ? await windowContext(found.app, chosen, signal, false, !chosen && found.menu, {
+          ? await windowContext(app, chosen, signal, false, !chosen && found.menu, {
               role: found.role,
               name: found.name,
             })
@@ -710,7 +717,7 @@ export function createComputerUse(
       menu: false,
       window: chosen.id,
       windowTitle: chosen.title,
-      ...(action === 'COMPUTER_KEY' ? await windowContext(app.name, chosen.id, signal, true) : {}),
+      ...(action === 'COMPUTER_KEY' ? await windowContext(app, chosen.id, signal, true) : {}),
     };
   }
 
@@ -735,6 +742,7 @@ export function createComputerUse(
     const request = {
       op: 'snapshot',
       app: app.name,
+      bundle: app.bundle,
       ...(prepared.window ? { window: prepared.window } : {}),
       ...(prepared.ref ? { ref: prepared.ref } : {}),
       ...(menu && !prepared.ref ? { menu: true } : {}),
@@ -781,6 +789,7 @@ export function createComputerUse(
       {
         op: 'find',
         app: app.name,
+        bundle: app.bundle,
         ...(prepared.window ? { window: prepared.window } : {}),
         ...(prepared.text ? { text: prepared.text } : {}),
         ...(prepared.role ? { role: prepared.role } : {}),
@@ -854,7 +863,7 @@ export function createComputerUse(
         listing = undefined;
         const before = await running(signal);
         const already = before.find((item) => sameApp(item, target));
-        if (already) unique(before, already.name);
+        if (already) unique(before, already);
         let pid = already?.pid;
         if (pid === undefined)
           try {
@@ -871,7 +880,7 @@ export function createComputerUse(
         const after = await running(signal);
         const app =
           after.find((item) => item.pid === pid) ?? after.find((item) => sameApp(item, target));
-        if (app) unique(after, app.name);
+        if (app) unique(after, app);
         grant(root, target, app);
         return {
           pid: app?.pid ?? pid,
@@ -893,7 +902,7 @@ export function createComputerUse(
         found.window !== prepared.control?.window
       )
         throw new IntegrationError('That control changed since this step was checked.', 409);
-      unique(await running(signal), found.app);
+      unique(await running(signal), { bundle: found.bundle, name: found.app });
       const current = await live(found, String(prepared.ref), signal);
       const unsettable =
         action === 'COMPUTER_TYPE' &&
@@ -915,6 +924,7 @@ export function createComputerUse(
             op: step(action),
             ref: prepared.ref,
             app: found.app,
+            bundle: found.bundle,
             role: found.role,
             control: { role: found.role, name: found.name },
             ...(prepared.windowBinding
@@ -946,7 +956,7 @@ export function createComputerUse(
       throw new IntegrationError('That app closed or changed since this step was checked.', 409);
     if (action === 'COMPUTER_SNAPSHOT') return () => snapshot(root, app, prepared, signal);
     if (action === 'COMPUTER_FIND') return () => find(root, app, prepared, signal);
-    const scope = { app: app.name, window: prepared.window };
+    const scope = { app: app.name, bundle: app.bundle, window: prepared.window };
     if (action === 'COMPUTER_SCREENSHOT')
       return () => ask({ op: 'screenshot', ...scope, noSecureFocus: true }, signal);
     checkedWindow(prepared);
