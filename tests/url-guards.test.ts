@@ -1508,6 +1508,65 @@ test('charts accept signed finite data and reject ambiguous series or excessive 
     assert.equal(presentationSchema.safeParse(value).success, false);
 });
 
+test('facts presentations validate references, copyable items, and public HTTPS action links', () => {
+  const receipt = {
+    version: 1,
+    type: 'facts',
+    title: 'Trattoria Alba · Table for 2',
+    status: { label: 'Confirmed', tone: 'done' },
+    reference: { label: 'Confirmation', value: 'TB-5529' },
+    items: [
+      { label: 'When', value: 'Fri 27 Nov · 19:30' },
+      { label: 'Ticket ID', value: 'RES-90210', copy: true },
+    ],
+    action: {
+      label: 'View booking',
+      url: 'https://tables.example.com/bookings/TB-5529',
+    },
+    sources: [{ label: 'Forkful', url: 'https://tables.example.com/bookings/TB-5529' }],
+  } as const;
+  const parsed = presentationInputSchema.parse(receipt);
+  assert.equal(parsed.type, 'facts');
+  const text = presentationText(parsed);
+  assert.match(text, /Confirmation: TB-5529/);
+  assert.match(text, /View booking: https:\/\/tables\.example\.com\/bookings\/TB-5529/);
+
+  const actionOnly = presentationInputSchema.safeParse({
+    version: 1,
+    type: 'facts',
+    title: 'Shopping cart',
+    sources: [],
+    action: { url: 'https://shop.example.com/cart' },
+  });
+  assert.equal(actionOnly.success, true);
+
+  const appAction = presentationInputSchema.parse({
+    version: 1,
+    type: 'facts',
+    title: 'Morning standup prep',
+    status: { label: 'Active', tone: 'done' },
+    items: [{ label: 'Schedule', value: 'Weekdays at 08:30' }],
+    action: { label: 'Open Scheduled', url: '/tasks' },
+    sources: [],
+  });
+  assert.equal(appAction.type, 'facts');
+  assert.match(
+    presentationText(appAction),
+    /Open Scheduled: https:\/\/nod\.n8n\.io\/docs\/open\/#\/tasks/,
+  );
+
+  for (const bad of [
+    { ...receipt, action: { url: 'http://shop.example.com/cart' } },
+    { ...receipt, action: { url: 'https://localhost/cart' } },
+    { ...receipt, action: { url: 'https://shop.example.com/cart?token=secret123' } },
+    { ...receipt, action: { url: '/api/artifacts/secret' } },
+    { ...receipt, action: { url: '/browser' } },
+    { ...receipt, reference: { label: 'Ref', value: '   ' } },
+    { version: 1, type: 'facts', title: 'Empty', sources: [] },
+  ])
+    assert.equal(presentationInputSchema.safeParse(bad).success, false, JSON.stringify(bad));
+});
+
 test('the browser proxy refuses a WebSocket upgrade to a private destination', async () => {
   let reached = 0;
   const sockets = new Set<import('node:stream').Duplex>();

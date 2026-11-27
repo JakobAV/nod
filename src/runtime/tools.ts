@@ -17,6 +17,7 @@ import {
   presentationSchema,
   type Presentation,
 } from '../shared/presentation.ts';
+import { appPagePath } from '../shared/app-links.ts';
 import { previewableUrl } from '../shared/link-preview.ts';
 import { proactiveUpdateSchema, sourceReadSchema } from '../shared/proactivity.ts';
 import { Value } from '@sinclair/typebox/value';
@@ -256,6 +257,13 @@ const safeHttpsUrl = (value: unknown) =>
   typeof value === 'string' && Boolean(previewableUrl(value)?.startsWith('https://'))
     ? value
     : undefined;
+const safeActionUrl = (value: unknown) => {
+  if (typeof value !== 'string') return undefined;
+  const appPath = appPagePath(value.trim());
+  if (appPath) return appPath;
+  return safeHttpsUrl(value);
+};
+const internalApiPathPattern = /^\/api(?:\/|$)/i;
 const normalizePresentationInput = (value: unknown) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   const record = { ...(value as Record<string, unknown>) };
@@ -284,6 +292,39 @@ const normalizePresentationInput = (value: unknown) => {
     if (coerced) record.status = coerced;
     else delete record.status;
   }
+  if (record.type === 'facts' && record.reference && typeof record.reference === 'object') {
+    const reference = { ...(record.reference as Record<string, unknown>) };
+    if (typeof reference.label === 'string') reference.label = clip(reference.label.trim(), 40);
+    if (typeof reference.value === 'string') reference.value = clip(reference.value.trim(), 80);
+    record.reference = reference;
+  }
+  if (record.type === 'facts' && 'action' in record) {
+    if (typeof record.action === 'string') {
+      const safe = safeActionUrl(record.action);
+      if (safe) record.action = { url: safe };
+      else delete record.action;
+    } else if (
+      record.action &&
+      typeof record.action === 'object' &&
+      !Array.isArray(record.action)
+    ) {
+      const action = { ...(record.action as Record<string, unknown>) };
+      const safe = safeActionUrl(action.url);
+      if (!safe) {
+        delete record.action;
+      } else {
+        action.url = safe;
+        if (typeof action.label === 'string') {
+          const trimmed = action.label.trim();
+          if (trimmed) action.label = clip(trimmed, 60);
+          else delete action.label;
+        }
+        record.action = action;
+      }
+    } else {
+      delete record.action;
+    }
+  }
   if (typeof record.note === 'string') record.note = clip(record.note.trim(), 220);
   if (typeof record.verdict === 'string') record.verdict = clip(record.verdict.trim(), 240);
   if (Array.isArray(record.items)) {
@@ -308,6 +349,31 @@ const normalizePresentationInput = (value: unknown) => {
       if ('url' in item && !safeHttpsUrl(item.url)) delete item.url;
       return item;
     });
+    if (record.type === 'facts') {
+      const refValue =
+        record.reference &&
+        typeof record.reference === 'object' &&
+        typeof (record.reference as { value?: unknown }).value === 'string'
+          ? (record.reference as { value: string }).value.trim().toLowerCase()
+          : undefined;
+      const actionHref =
+        record.action &&
+        typeof record.action === 'object' &&
+        typeof (record.action as { url?: unknown }).url === 'string'
+          ? (record.action as { url: string }).url.trim().toLowerCase()
+          : undefined;
+      record.items = (record.items as unknown[]).filter((entry) => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return true;
+        const val = (entry as { value?: unknown }).value;
+        if (typeof val !== 'string') return true;
+        const trimmed = val.trim();
+        const lower = trimmed.toLowerCase();
+        if (refValue && lower === refValue) return false;
+        if (actionHref && lower === actionHref) return false;
+        if (internalApiPathPattern.test(trimmed)) return false;
+        return true;
+      });
+    }
   }
   return record;
 };

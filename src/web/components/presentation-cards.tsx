@@ -1,4 +1,5 @@
-import { createContext, Fragment, useContext, useState, type ReactNode } from 'react';
+import { createContext, Fragment, useContext, useEffect, useState, type ReactNode } from 'react';
+import { appPagePath, appPages } from '../../shared/app-links';
 import {
   compareColumn,
   draftSendLabel,
@@ -7,7 +8,8 @@ import {
   mapTileSize,
   type Presentation,
 } from '../../shared/presentation';
-import { AlertCircle, Check, ChevronDown, ExternalLink, LockKeyhole, Send } from './icons';
+import { copyContent } from '../lib/clipboard';
+import { AlertCircle, Check, ChevronDown, Copy, ExternalLink, LockKeyhole, Send } from './icons';
 
 export interface CardPick {
   chosen: number[];
@@ -737,13 +739,42 @@ function Journey({ journey }: { journey: NonNullable<Item['journeys']>[number] }
   );
 }
 
-function Facts({ items }: { items: Array<{ label: string; value: string; strong?: boolean }> }) {
+function CopyValueButton({ value, label }: { value: string; label: string }) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 2000);
+    return () => clearTimeout(timer);
+  }, [copied]);
+  return (
+    <button
+      type="button"
+      className="card-copy"
+      aria-label={copied ? `Copied ${label}` : `Copy ${label}`}
+      title={copied ? 'Copied' : `Copy ${label}`}
+      onClick={() => {
+        void copyContent(value).then(() => setCopied(true));
+      }}
+    >
+      {copied ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
+    </button>
+  );
+}
+
+function Facts({
+  items,
+}: {
+  items: Array<{ label: string; value: string; strong?: boolean; copy?: boolean }>;
+}) {
   return (
     <dl className="card-facts">
       {items.map((item, index) => (
         <div key={index} data-strong={item.strong || undefined}>
           <dt>{item.label}</dt>
-          <dd>{item.value}</dd>
+          <dd className={item.copy ? 'card-fact-copy' : undefined}>
+            {item.copy ? <code>{item.value}</code> : item.value}
+            {item.copy && <CopyValueButton value={item.value} label={item.label} />}
+          </dd>
         </div>
       ))}
     </dl>
@@ -764,9 +795,81 @@ function Stats({ items }: { items: NonNullable<Visual<'facts'>['stats']> }) {
   );
 }
 
+function FactReference({ reference }: { reference: NonNullable<Visual<'facts'>['reference']> }) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 2000);
+    return () => clearTimeout(timer);
+  }, [copied]);
+  return (
+    <div className="card-band card-reference">
+      <div className="card-reference-meta">
+        <span className="card-reference-label">{reference.label}</span>
+        <code className="card-reference-value">{reference.value}</code>
+      </div>
+      <button
+        type="button"
+        className="card-reference-copy"
+        aria-label={copied ? `Copied ${reference.label}` : `Copy ${reference.label}`}
+        onClick={() => {
+          void copyContent(reference.value).then(() => setCopied(true));
+        }}
+      >
+        {copied ? (
+          <>
+            <Check size={13} aria-hidden="true" />
+            Copied
+          </>
+        ) : (
+          <>
+            <Copy size={13} aria-hidden="true" />
+            Copy
+          </>
+        )}
+      </button>
+    </div>
+  );
+}
+
+export function FactAction({ action }: { action?: Visual<'facts'>['action'] }) {
+  if (!action) return null;
+  const appPath = appPagePath(action.url);
+  if (appPath) {
+    const pageName = Object.hasOwn(appPages, appPath)
+      ? appPages[appPath as keyof typeof appPages]
+      : 'Nod';
+    return (
+      <div className="card-band card-action-bar">
+        <a className="button button-outline button-sm card-action-link" href={appPath}>
+          {action.label ?? `Open ${pageName}`}
+        </a>
+        <span className="card-action-host">{pageName}</span>
+      </div>
+    );
+  }
+  const host = hostLabel(action.url);
+  return (
+    <div className="card-band card-action-bar">
+      <a
+        className="button button-outline button-sm card-action-link"
+        href={action.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        referrerPolicy="no-referrer"
+      >
+        {action.label ?? `Open on ${host}`}
+        <ExternalLink size={13} aria-hidden="true" />
+      </a>
+      <span className="card-action-host">{host}</span>
+    </div>
+  );
+}
+
 export function FactList({ visual }: { visual: Visual<'facts'> }) {
   return (
     <>
+      {visual.reference && <FactReference reference={visual.reference} />}
       {visual.stats && (
         <div className="card-band">
           <Stats items={visual.stats} />
