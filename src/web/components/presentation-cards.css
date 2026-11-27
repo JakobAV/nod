@@ -841,9 +841,20 @@ a.card-row {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+  max-width: 100%;
   text-decoration: none;
 }
+.card-action-link svg {
+  flex: none;
+}
+.card-action-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .card-action-host {
+  min-width: 0;
   color: var(--muted-foreground);
   font-size: 12px;
   overflow: hidden;

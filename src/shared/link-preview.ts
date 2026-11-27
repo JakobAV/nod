@@ -31,6 +31,18 @@ export function publicMediaUrl(value: string): string | null {
   }
 }
 
+function hasSensitiveParams(params: URLSearchParams, sensitive: RegExp): boolean {
+  for (const [key, param] of params) {
+    if (
+      sensitive.test(key) ||
+      /^[A-Za-z\d_-]{40,}$/.test(param) ||
+      /^eyJ[A-Za-z\d_-]*\.[A-Za-z\d_-]+\.[A-Za-z\d_-]*$/.test(param)
+    )
+      return true;
+  }
+  return false;
+}
+
 export function publicActionUrl(value: string): string | null {
   if (value.length > 2048) return null;
   try {
@@ -44,7 +56,7 @@ export function publicActionUrl(value: string): string | null {
       return null;
     const decoded = decodeURIComponent(url.pathname + url.hash);
     if (
-      /(?:^|\/)(?:vault|credentials|credential-requests|payments|payment-requests|approvals?|consent|reset|auth|oauth|authorize|login|signin|reset-password|password-reset|invite|invitation|unsubscribe|logout|signout)(?:\/|$|[?#])/i.test(
+      /(?:^|[/#])(?:vault|credentials|credential-requests|payments|payment-requests|approvals?|consent|reset|auth|oauth|authorize|login|signin|reset-password|password-reset|invite|invitation|unsubscribe|logout|signout)(?:\/|$|[?#])/i.test(
         decoded,
       ) ||
       /\/api\/artifacts(?:\/|$)/i.test(decoded)
@@ -58,15 +70,30 @@ export function publicActionUrl(value: string): string | null {
       return null;
     const sensitive =
       /(?:token|secret|password|passcode|credential|signature|session|authorization|(?:^|[_-])(?:key|auth|sig|jwt|state|nonce|grant|challenge)(?:$|[_-]))/i;
-    for (const [key, param] of url.searchParams) {
+    if (hasSensitiveParams(url.searchParams, sensitive)) return null;
+    if (url.pathname.split('/').some((part) => /^[A-Za-z\d_-]{64,}$/.test(part))) return null;
+    const hash = url.hash.startsWith('#') ? url.hash.slice(1) : '';
+    if (hash) {
+      const decodedHash = decodeURIComponent(hash);
       if (
-        sensitive.test(key) ||
-        /^[A-Za-z\d_-]{40,}$/.test(param) ||
-        /^eyJ[A-Za-z\d_-]*\.[A-Za-z\d_-]+\.[A-Za-z\d_-]*$/.test(param)
+        decodedHash
+          .split(/[/?&#=]/)
+          .some(
+            (part) =>
+              /^[A-Za-z\d_-]{64,}$/.test(part) ||
+              /^eyJ[A-Za-z\d_-]*\.[A-Za-z\d_-]+\.[A-Za-z\d_-]*$/.test(part),
+          )
       )
         return null;
+      const queryIndex = hash.indexOf('?');
+      if (
+        queryIndex >= 0 &&
+        hasSensitiveParams(new URLSearchParams(hash.slice(queryIndex + 1)), sensitive)
+      )
+        return null;
+      if (hash.includes('=') && hasSensitiveParams(new URLSearchParams(hash), sensitive))
+        return null;
     }
-    if (url.pathname.split('/').some((part) => /^[A-Za-z\d_-]{64,}$/.test(part))) return null;
     return url.href;
   } catch {
     return null;

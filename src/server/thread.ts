@@ -3053,6 +3053,7 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
     )
       ?.replace(/```[\s\S]*?```/g, '')
       .replace(/!?\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/^[ \t]*[^:\n]+:[ \t]*https?:\/\/\S+[ \t]*$/gm, '')
       .replace(/https?:\/\/\S+/g, '')
       .replace(/^[ \t]*(?:#{1,6}|>|[-*+]|\d+\.)[ \t]+/gm, '')
       .replace(/(\*\*|__|`)(.*?)\1/g, '$2')

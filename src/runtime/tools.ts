@@ -294,7 +294,7 @@ export const normalizePresentationInput = (value: unknown) => {
   if (record.type === 'facts' && record.reference && typeof record.reference === 'object') {
     const reference = { ...(record.reference as Record<string, unknown>) };
     if (typeof reference.label === 'string') reference.label = clip(reference.label.trim(), 40);
-    if (typeof reference.value === 'string') reference.value = clip(reference.value.trim(), 80);
+    if (typeof reference.value === 'string') reference.value = reference.value.trim();
     record.reference = reference;
   }
   if (record.type === 'facts' && 'action' in record) {

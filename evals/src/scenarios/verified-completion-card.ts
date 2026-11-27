@@ -94,6 +94,8 @@ export default scenario({
         () => ({
           pass:
             state.booking?.id === 'CM-8412' &&
+            state.booking?.restaurant === 'Casa Mar' &&
+            state.booking?.date === state.friday &&
             state.booking?.time === '20:00' &&
             state.booking?.people === 2,
           evidence: state.booking ? JSON.stringify(state.booking) : 'no booking created',
@@ -112,9 +114,11 @@ export default scenario({
               : [];
             const hasRef =
               (ref?.value ?? '').toUpperCase().includes('CM-8412') ||
-              items.some((item) => (item.value ?? '').toUpperCase().includes('CM-8412'));
-            const hasAction =
-              typeof action?.url === 'string' && action.url.includes('/bookings/CM-8412');
+              items.some(
+                (item) =>
+                  item.copy === true && (item.value ?? '').toUpperCase().includes('CM-8412'),
+              );
+            const hasAction = action?.url === world.bookingUrl;
             return hasRef && hasAction;
           });
           return {

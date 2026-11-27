@@ -1578,9 +1578,18 @@ test('facts presentations validate references, copyable items, and public HTTPS 
     { ...receipt, action: { url: 'https://user:pass@shop.example.com/cart' } },
     { ...receipt, action: { url: 'https://shop.example.com/cart?token=secret123' } },
     { ...receipt, action: { url: 'https://shop.example.com/reset-password/abc' } },
+    { ...receipt, action: { url: 'https://app.foo.com/#/orders?token=abc123' } },
+    {
+      ...receipt,
+      action: { url: 'https://app.foo.com/#id_token=eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.' },
+    },
+    { ...receipt, action: { url: `https://app.foo.com/#/magic/${'a'.repeat(64)}` } },
+    { ...receipt, action: { url: 'https://app.foo.com/#login' } },
+    { ...receipt, action: { url: 'https://app.foo.com/#reset-password/abc' } },
     { ...receipt, action: { url: '/api/artifacts/secret' } },
     { ...receipt, action: { url: '/browser' } },
     { ...receipt, reference: { label: 'Ref', value: '   ' } },
+    { ...receipt, reference: { label: 'Ref', value: 'R'.repeat(81) } },
     { version: 1, type: 'facts', title: 'Empty', sources: [] },
   ])
     assert.equal(presentationInputSchema.safeParse(bad).success, false, JSON.stringify(bad));

@@ -739,24 +739,45 @@ function Journey({ journey }: { journey: NonNullable<Item['journeys']>[number] }
   );
 }
 
-function CopyValueButton({ value, label }: { value: string; label: string }) {
-  const [copied, setCopied] = useState(false);
+function useCopyState() {
+  const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle');
   useEffect(() => {
-    if (!copied) return;
-    const timer = setTimeout(() => setCopied(false), 2000);
+    if (state === 'idle') return;
+    const timer = setTimeout(() => setState('idle'), 2000);
     return () => clearTimeout(timer);
-  }, [copied]);
+  }, [state]);
+  const copy = (value: string) => {
+    void copyContent(value)
+      .then(() => setState('copied'))
+      .catch(() => setState('failed'));
+  };
+  return { state, copy };
+}
+
+function CopyValueButton({ value, label }: { value: string; label: string }) {
+  const { state, copy } = useCopyState();
+  const statusText =
+    state === 'copied'
+      ? `Copied ${label}`
+      : state === 'failed'
+        ? `Could not copy ${label}`
+        : `Copy ${label}`;
   return (
     <button
       type="button"
       className="card-copy"
-      aria-label={copied ? `Copied ${label}` : `Copy ${label}`}
-      title={copied ? 'Copied' : `Copy ${label}`}
-      onClick={() => {
-        void copyContent(value).then(() => setCopied(true));
-      }}
+      data-copy-state={state === 'idle' ? undefined : state}
+      aria-label={statusText}
+      title={
+        state === 'copied' ? 'Copied' : state === 'failed' ? 'Could not copy' : `Copy ${label}`
+      }
+      onClick={() => copy(value)}
     >
-      {copied ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
+      {state === 'copied' ? (
+        <Check size={13} aria-hidden="true" />
+      ) : (
+        <Copy size={13} aria-hidden="true" />
+      )}
     </button>
   );
 }
@@ -796,12 +817,13 @@ function Stats({ items }: { items: NonNullable<Visual<'facts'>['stats']> }) {
 }
 
 function FactReference({ reference }: { reference: NonNullable<Visual<'facts'>['reference']> }) {
-  const [copied, setCopied] = useState(false);
-  useEffect(() => {
-    if (!copied) return;
-    const timer = setTimeout(() => setCopied(false), 2000);
-    return () => clearTimeout(timer);
-  }, [copied]);
+  const { state, copy } = useCopyState();
+  const ariaLabel =
+    state === 'copied'
+      ? `Copied ${reference.label}`
+      : state === 'failed'
+        ? `Could not copy ${reference.label}`
+        : `Copy ${reference.label}`;
   return (
     <div className="card-band card-reference">
       <div className="card-reference-meta">
@@ -811,15 +833,19 @@ function FactReference({ reference }: { reference: NonNullable<Visual<'facts'>['
       <button
         type="button"
         className="card-reference-copy"
-        aria-label={copied ? `Copied ${reference.label}` : `Copy ${reference.label}`}
-        onClick={() => {
-          void copyContent(reference.value).then(() => setCopied(true));
-        }}
+        data-copy-state={state === 'idle' ? undefined : state}
+        aria-label={ariaLabel}
+        onClick={() => copy(reference.value)}
       >
-        {copied ? (
+        {state === 'copied' ? (
           <>
             <Check size={13} aria-hidden="true" />
             Copied
+          </>
+        ) : state === 'failed' ? (
+          <>
+            <Copy size={13} aria-hidden="true" />
+            Could not copy
           </>
         ) : (
           <>
@@ -842,7 +868,7 @@ export function FactAction({ action }: { action?: Visual<'facts'>['action'] }) {
     return (
       <div className="card-band card-action-bar">
         <a className="button button-outline button-sm card-action-link" href={appPath}>
-          {action.label ?? `Open ${pageName}`}
+          <span className="card-action-label">{action.label ?? `Open ${pageName}`}</span>
         </a>
         <span className="card-action-host">{pageName}</span>
       </div>
@@ -858,7 +884,7 @@ export function FactAction({ action }: { action?: Visual<'facts'>['action'] }) {
         rel="noopener noreferrer"
         referrerPolicy="no-referrer"
       >
-        {action.label ?? `Open on ${host}`}
+        <span className="card-action-label">{action.label ?? `Open on ${host}`}</span>
         <ExternalLink size={13} aria-hidden="true" />
       </a>
       <span className="card-action-host">{host}</span>

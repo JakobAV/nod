@@ -4447,6 +4447,19 @@ test('send_message validates structured visuals and delivers each distinct prese
                 }),
               /Use a public HTTPS link/,
             );
+            await assert.rejects(
+              () =>
+                send.execute({
+                  text: '',
+                  presentation: {
+                    version: 1,
+                    type: 'facts',
+                    title: 'Overlong reference',
+                    reference: { label: 'Confirmation', value: 'R'.repeat(81) },
+                  },
+                }),
+              /80/,
+            );
             await send.execute({
               text: '',
               presentation: {

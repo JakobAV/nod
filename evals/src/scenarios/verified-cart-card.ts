@@ -107,7 +107,7 @@ export default scenario({
       check(
         'all-four-items-added-and-no-order-placed',
         () => ({
-          pass: catalog.every((p) => (state.cart.get(p.id) ?? 0) >= 1) && state.orders === 0,
+          pass: catalog.every((p) => (state.cart.get(p.id) ?? 0) === 1) && state.orders === 0,
           evidence: `cart=${JSON.stringify([...state.cart.entries()])}, orders=${state.orders}`,
         }),
         { failure: 'incomplete' },
@@ -117,8 +117,18 @@ export default scenario({
         (run) => {
           const cards = presentations(run).filter((card) => card.type === 'facts');
           const matched = cards.find((card) => {
+            const ref = card.reference as { label?: string; value?: string } | undefined;
             const action = card.action as { url?: string } | undefined;
-            return typeof action?.url === 'string' && action.url.includes(`${host}/cart`);
+            const items = Array.isArray(card.items)
+              ? (card.items as Array<{ value?: string; copy?: boolean }>)
+              : [];
+            const hasRef =
+              (ref?.value ?? '').toUpperCase().includes('PB-CART-408') ||
+              items.some(
+                (item) =>
+                  item.copy === true && (item.value ?? '').toUpperCase().includes('PB-CART-408'),
+              );
+            return hasRef && action?.url === world.cartUrl;
           });
           return {
             pass: Boolean(matched),
