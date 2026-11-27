@@ -4,7 +4,7 @@ import type { ProviderUsageEvent } from './provider-usage.ts';
 import type { ExecutionEvent, ExecutionScope } from '../shared/execution.ts';
 import type { ConnectedApp } from './integrations.ts';
 import type { DiscoveredTool } from './discovered.ts';
-import type { BrowserAction, BrowserPage, CredentialKind, WorkspaceSession } from './computer.ts';
+import type { BrowserAction, BrowserPage, WorkspaceSession } from './computer.ts';
 import type {
   AgentReactionResult,
   Artifact,
@@ -47,16 +47,6 @@ export type RuntimeObservation = (
       durationMs: number;
     }
 ) & { execution?: ExecutionScope };
-
-export type BrowserConnectionRequest =
-  | {
-      action: 'connect';
-      url: string;
-      connectionId?: string;
-      label?: string;
-    }
-  | { action: 'use'; url: string; connectionId: string }
-  | { action: 'save'; url: string; connectionId: string; signedIn: true };
 
 export interface BrowserStep {
   step: BrowserAction | { action: 'upload'; selector: string; path: string };
@@ -126,6 +116,8 @@ export interface RuntimeContext {
   background?: boolean;
   scheduleCache?: 'short' | 'long';
   model?: ModelSelection;
+  modelChosen?: boolean;
+  delegateModel?: ModelSelection;
   channel?: string;
   runtimeHost?: 'desktop' | 'server';
   timeZone?: string;
@@ -179,6 +171,7 @@ export interface RuntimeContext {
   previousFailure?: string;
   withdrawnRequest?: 'stopped' | 'failed';
   confirmedActions?: string[];
+  approvals?: Array<{ title: string; status: string; createdAt: string }>;
   credentialRequests?: Array<
     Pick<CredentialRequest, 'turnId' | 'origin' | 'label' | 'kind' | 'status' | 'notEntered'>
   >;
@@ -205,7 +198,7 @@ export interface RuntimeContext {
   reply(
     text: string,
     streamId?: string,
-    replyToMessageId?: string,
+    replyToMessageId?: string | null,
     presentation?: Presentation,
     handoff?: boolean,
   ): Promise<void>;
@@ -221,9 +214,9 @@ export interface RuntimeContext {
     query?: string,
     connectionId?: string,
   ): Promise<unknown>;
-  browserConnection?(request: BrowserConnectionRequest): Promise<unknown>;
   browserStep?(
     request: BrowserStep,
+    admit?: (asks: boolean, read?: boolean) => Promise<void>,
   ): Promise<
     | 'run'
     | 'refused'
@@ -248,7 +241,7 @@ export interface RuntimeContext {
       label: string;
     } & (
       | {
-          kind: CredentialKind;
+          kind?: 'otp';
           savedLoginId?: string;
           usernameSelector?: string;
           passwordSelector?: string | string[];
@@ -261,13 +254,18 @@ export interface RuntimeContext {
           methods: { label: string; selector: string }[];
         }
     ),
+    admit?: (asks: boolean, read?: boolean) => Promise<void>,
   ): Promise<{ url: string } | { filled: true } | { [appConfirmation]: string }>;
-  requestPayment?(input: unknown): Promise<{ question: string; action: string; url?: string }>;
+  requestPayment?(
+    input: unknown,
+    admit?: (asks: boolean, read?: boolean) => Promise<void>,
+  ): Promise<{ question: string; action: string; url?: string }>;
   integration(
     action: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
     admit?: (asks: boolean, read?: boolean) => Promise<void>,
+    nested?: boolean,
   ): Promise<unknown>;
 
   manage(
@@ -285,11 +283,13 @@ export interface RuntimeContext {
       attachments: RuntimeContext['attachments'];
     }>
   >;
+  hasQueuedMessages?(): Promise<boolean>;
 }
 export interface RuntimeResult {
   status: 'succeeded' | 'waiting_credentials' | 'waiting_user';
   waitingFor?: 'question' | 'approval' | 'credentials';
   message?: string;
+  replyToMessageId?: string | null;
   answerChoices?: AnswerChoices;
   handoffBrowserId?: string;
   result?: string;
@@ -318,6 +318,7 @@ export interface AgentToolMetadata {
 }
 export interface AgentTool extends AgentToolMetadata {
   parallel?: boolean;
+  early?: boolean;
   execute(args: Record<string, unknown>, options?: { nested?: boolean }): Promise<AgentToolResult>;
 }
 export interface SkillLibrary {
@@ -347,6 +348,7 @@ export type AgentEvent =
       type: 'message_end';
       status?: 'succeeded' | 'failed' | 'cancelled' | 'incomplete';
       contextExhausted?: boolean;
+      beforeTool?: string;
     }
   | { type: 'text_delta'; text: string }
   | { type: 'thinking'; title: string }
@@ -354,7 +356,7 @@ export type AgentEvent =
   | { type: 'fallback'; from: string; to: string }
   | { type: 'final'; text: string }
   | ModelUsageObservation
-  | { type: 'error'; message: string; contextExhausted?: boolean };
+  | { type: 'error'; message: string; contextExhausted?: boolean; failure?: ModelFailure };
 export interface AgentAudio {
   id: string;
   mimeType: string;
@@ -369,6 +371,7 @@ export interface AgentToolOutcome {
 }
 export interface AgentSessionOptions extends ExecutionScope {
   model?: ModelSelection;
+  lighterEffort?: boolean;
   automatic?: boolean;
   restricted?: boolean;
   ephemeral?: boolean;
@@ -411,7 +414,23 @@ export interface Agent {
   open(options: AgentSessionOptions): Promise<AgentSession>;
   dispose(): void | Promise<void>;
 }
-export class ModelRequestError extends Error {}
+export interface ModelFailure {
+  kind:
+    | 'authentication'
+    | 'permission'
+    | 'rate_limited'
+    | 'timeout'
+    | 'unavailable'
+    | 'invalid_request'
+    | 'unknown'
+    | 'tools_unsupported'
+    | 'quota_exhausted'
+    | 'context_too_large';
+  status?: number;
+}
+export class ModelRequestError extends Error {
+  failure?: ModelFailure;
+}
 export class ContextLimitError extends ModelRequestError {}
 export class OutputLimitError extends Error {}
 export class ToolFailureError extends Error {}

@@ -111,7 +111,8 @@ export function trustBasis(
     source?: unknown;
     terms?: unknown;
   };
-  if (Array.isArray(terms) && terms.some((term) => term?.same === false)) return undefined;
+  if ([terms].flat().some((term) => (term as { same?: unknown } | null)?.same === false))
+    return undefined;
   const cited =
     typeof source === 'string'
       ? source
@@ -126,7 +127,7 @@ export function trustBasis(
   const command = args.command;
   const opens =
     opensContent(name) ||
-    ['NOD_sign_in', 'NOD_browser_session', 'NOD_vault_allow'].includes(name) ||
+    ['NOD_sign_in', 'NOD_vault_allow'].includes(name) ||
     (name === 'NOD_browser' &&
       (args.step === 'upload' ||
         (command &&

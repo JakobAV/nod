@@ -14,7 +14,7 @@ import {
 } from '../ports/agent.ts';
 import {
   apiKeyConnectionProviders,
-  lightestEffort,
+  checkEffort,
   modelProviderInfo,
   modelProviderNames,
   modelProviders,
@@ -152,7 +152,6 @@ import type { TrustBasis } from './trust-basis.ts';
 import {
   validateInstructionRevision,
   validateScheduledInstructions,
-  instructionSourceMessageIds,
   type InstructionRevision,
 } from './owner-instructions.ts';
 import { localArtifacts } from './artifacts.ts';
@@ -245,7 +244,6 @@ import {
 } from './vault.ts';
 import { createVaultAccess } from './vault-access.ts';
 import { createPayments } from './payments.ts';
-import { BrowserConnectionError, createBrowserConnections } from './browser-connections.ts';
 import { cachedIcons, registerLinkOpened } from './link-previews.ts';
 import { appPages } from '../shared/app-links.ts';
 export interface ApplicationAdapters {
@@ -433,12 +431,12 @@ export function createDefaultAdapters(
       const access = await models.resolve();
       return {
         ...access,
-        effort: lightestEffort(access.definition.choice.efforts),
+        effort: checkEffort(access.definition.choice.efforts),
         ...(access.textModel
           ? {
               textModel: {
                 ...access.textModel,
-                effort: lightestEffort(access.textModel.definition.choice.efforts),
+                effort: checkEffort(access.textModel.definition.choice.efforts),
               },
             }
           : {}),
@@ -729,7 +727,7 @@ function alternativeModel(models: ApplicationAdapters['models']) {
     ? {
         connectionId: other.id,
         modelId: choice.id,
-        effort: defaultEffort(other.provider, choice),
+        effort: defaultEffort(choice),
         label: `${modelProviderNames[other.provider]} · ${choice.name}`,
       }
     : undefined;
@@ -1357,7 +1355,6 @@ async function initializeApplication(
   let vault!: Awaited<ReturnType<typeof createVault>>;
   let vaultAccess!: Awaited<ReturnType<typeof createVaultAccess>>;
   let payments!: Awaited<ReturnType<typeof createPayments>>;
-  let browserConnections!: Awaited<ReturnType<typeof createBrowserConnections>>;
   const previews = adapters.linkPreviews;
   const icon = previews ? cachedIcons((origin) => previews.icon(origin)) : undefined;
   const computerUse = createComputerUse(pool, ownerId, { desktop: adapters.desktop });
@@ -1409,7 +1406,6 @@ async function initializeApplication(
     callbackReturnTo: desktopMode ? 'window' : undefined,
     discovered,
     browserAccounts: (client) => vault.list(ownerId, client),
-    browserConnections: (client) => browserConnections.list(client),
     icon,
   });
   const scheduleIdeas = createScheduleIdeas({
@@ -1462,13 +1458,6 @@ async function initializeApplication(
         },
         client,
       ),
-  });
-  browserConnections = await createBrowserConnections(pool, {
-    analytics: captureAnalytics,
-    analyticsConsent,
-    ownerId,
-    computer,
-    refresh,
   });
   const chatVerification = await createChatVerification(pool, {
     ownerId,
@@ -1817,7 +1806,6 @@ async function initializeApplication(
                             .object({
                               rules: z.string(),
                               standingInstruction: z.string().optional(),
-                              sourceMessageIds: z.array(z.uuid()).optional(),
                               chat: z
                                 .object({ threadId: z.uuid(), id: z.uuid() })
                                 .strict()
@@ -1837,12 +1825,7 @@ async function initializeApplication(
                             !instruction.success ||
                             (origin.source === 'event' &&
                               instruction.data.standingInstruction === undefined) ||
-                            (origin.source === 'schedule' &&
-                              (!origin.scheduleInstruction ||
-                                !isDeepStrictEqual(
-                                  instruction.data.sourceMessageIds,
-                                  instructionSourceMessageIds(origin.scheduleInstruction),
-                                ))) ||
+                            (origin.source === 'schedule' && !origin.scheduleInstruction) ||
                             !saved ||
                             typeof saved !== 'object' ||
                             Array.isArray(saved) ||
@@ -1867,11 +1850,7 @@ async function initializeApplication(
                                     turnLock,
                                     async () => {
                                       if (origin.source === 'schedule')
-                                        await validateScheduledInstructions(
-                                          client,
-                                          ownerId,
-                                          origin.scheduleInstruction,
-                                        );
+                                        validateScheduledInstructions(origin.scheduleInstruction);
                                       await validateInstructionRevision(
                                         client,
                                         ownerId,
@@ -2203,7 +2182,6 @@ async function initializeApplication(
                   await Promise.all([
                     integrations.analyticsConnections(),
                     discovered.analyticsConnections(),
-                    browserConnections.analyticsConnections(),
                   ])
                 ).flat(),
           () => (only === 'apps' ? [] : (adapters.models?.analyticsConnections() ?? [])),
@@ -2230,16 +2208,17 @@ async function initializeApplication(
     turn: TurnRef,
     target: {
       origin: string;
-      kind: 'sign_in' | 'session' | 'form';
+      kind: 'sign_in' | 'form';
       account?: string;
       itemId?: string;
-      sessionOrigin?: string;
     },
+    admit?: (asks: boolean, read?: boolean) => Promise<void>,
   ): Promise<{ reason: VaultActivityReason; basis?: TrustBasis } | { question: string }> {
-    const access = await vaultAccess.authorize(turn, target);
+    const access = await vaultAccess.authorize(turn, target, admit);
     if (access.ok)
       return { reason: access.reason, ...(access.basis ? { basis: access.basis } : {}) };
     const result = await approvals.request(turn, 'NOD_vault_allow', access.args, {
+      admit,
       details: access.details,
     });
     if (result && typeof result === 'object' && appConfirmation in result)
@@ -2412,7 +2391,8 @@ async function initializeApplication(
   payments = await createPayments(pool, {
     ownerId,
     analytics: captureAnalytics,
-    present: (turn, input) => communication.presentPayment(turn.threadId, input),
+    present: (turn, input) =>
+      communication.presentPayment(turn.threadId, input, undefined, turn.turnId),
     uses: vault.uses,
     page: (threadId) => computer.currentPage(threadId),
     destinations: (threadId, fields) => computer.cardDestinations(threadId, fields),
@@ -2535,6 +2515,10 @@ async function initializeApplication(
       artifacts,
       writeArtifact: workspace.writeArtifact.bind(workspace),
       readArtifact: workspace.readArtifact.bind(workspace),
+      cardImage: previews?.image ? (url, signal) => previews.image!(url, signal) : undefined,
+      mapTile: previews?.mapTile
+        ? (zoom, x, y, signal) => previews.mapTile!(zoom, x, y, signal)
+        : undefined,
       mailCheck,
       executeConfirmation: approvals.executeConfirmed,
       stoppedOutcomes: approvals.stoppedOutcomes,
@@ -2554,12 +2538,21 @@ async function initializeApplication(
                 )
               ).rowCount,
             ));
+        const origin = adapters.models && (await workOrigin(context.turnId));
+        const follows = origin ? adapters.models!.workModel(origin).follows : 'chat';
+        const modelChosen = follows !== 'chat' && follows !== 'light';
+        const delegateModel = modelChosen ? undefined : (adapters.models?.light() ?? undefined);
         const run = () =>
           ledger.withTurn(
             context.turnId,
             () =>
               runtime
-                .runTurn({ ...context, runtimeHost: desktopMode ? 'desktop' : 'server' })
+                .runTurn({
+                  ...context,
+                  ...(modelChosen ? { modelChosen } : {}),
+                  ...(delegateModel ? { delegateModel } : {}),
+                  runtimeHost: desktopMode ? 'desktop' : 'server',
+                })
                 .finally(() => proactivity.release(context.turnId)),
             Boolean(context.spendingLimitReached),
             Boolean(context.automatic),
@@ -2580,7 +2573,7 @@ async function initializeApplication(
       taskContext: tasks.context,
       settleTask: tasks.settle,
       taskLedger: tasks.read,
-      task: async (turn, raw, sourceMessageId, priorMessageId, priorHandoff) => {
+      task: async (turn, raw, sourceMessageId, priorMessageId, priorHandoff, sourcePrompt) => {
         const request = raw as { action?: unknown; model?: unknown } | undefined;
         if (request?.action === 'start' && request.model) {
           const current = (
@@ -2611,14 +2604,22 @@ async function initializeApplication(
             sourceMessageId,
             priorMessageId,
             priorHandoff,
+            sourcePrompt,
           );
         }
-        return tasks.execute(turn, raw, sourceMessageId, priorMessageId, priorHandoff);
+        return tasks.execute(
+          turn,
+          raw,
+          sourceMessageId,
+          priorMessageId,
+          priorHandoff,
+          sourcePrompt,
+        );
       },
       startTurn: async (turn) => {
         const origin = await turnOrigin(turn.turnId);
         if (origin?.source === 'schedule')
-          await validateScheduledInstructions(pool, ownerId, origin.scheduleInstruction);
+          validateScheduledInstructions(origin.scheduleInstruction);
         await tasks.inherit(turn);
       },
       connections: async (...args) => {
@@ -2628,13 +2629,18 @@ async function initializeApplication(
         const turn = args[2];
         try {
           if (!turn) throw new Error('The connection needs an active conversation.');
-          const message = await communication.present(turn.threadId, {
-            kind: 'connection',
-            app: result.name,
-            operation: 'operation' in result ? result.operation : 'connect',
-            ...('account' in result ? { account: result.account } : {}),
-            next: 'complete_private_sign_in',
-          });
+          const message = await communication.present(
+            turn.threadId,
+            {
+              kind: 'connection',
+              app: result.name,
+              operation: 'operation' in result ? result.operation : 'connect',
+              ...('account' in result ? { account: result.account } : {}),
+              next: 'complete_private_sign_in',
+            },
+            undefined,
+            turn.turnId,
+          );
           return { ...result, message };
         } catch (error) {
           await integrations
@@ -2646,7 +2652,7 @@ async function initializeApplication(
           throw error;
         }
       },
-      browserStep: async (turn, request, signal) => {
+      browserStep: async (turn, request, signal, admit) => {
         const args = browserStepArgs(request);
         const verdict = await trust.check(turn, 'NOD_browser', args, signal);
         const prepareConfirmation = async () => {
@@ -2715,8 +2721,9 @@ async function initializeApplication(
           const handoff = await approvals.request(turn, 'NOD_browser', args, {
             allowed: true,
             prepareConfirmation,
-            admit: async (asks) => {
+            admit: async (asks, read) => {
               if (asks && request.subagent) throw new Error('A subagent cannot ask the owner.');
+              await admit?.(asks, read);
             },
             signal,
             run: async () => 'run',
@@ -2730,40 +2737,13 @@ async function initializeApplication(
         if (request.subagent) return 'refused';
         const result = await approvals.request(turn, 'NOD_browser', args, {
           signal,
+          admit,
           details: { reason: verdict.reason },
           prepareConfirmation,
         });
         return result && typeof result === 'object' && appConfirmation in result
           ? result
           : { result };
-      },
-      browserConnection: async (request, turn, signal, launch) => {
-        const target = await browserConnections.target(request);
-        if (!target)
-          return browserConnections.request(request, turn, signal, launch).catch(async (error) => {
-            if (
-              error instanceof BrowserConnectionError &&
-              error.statusCode === 404 &&
-              (await vault.list(ownerId)).some((entry) => entry.id === request.connectionId)
-            )
-              throw new Error(
-                'This ID is a saved Vault login, not a browser profile. Open the sign-in page with browser, then use sign_in with savedLoginId set to this ID.',
-              );
-            throw error;
-          });
-        const access = await permitVault(turn, target);
-        if ('question' in access) return { [appConfirmation]: access.question };
-        const result = await browserConnections.request(request, turn, signal, launch);
-        if (result.status === 'session_opened')
-          await vaultAccess.record(turn, {
-            action: 'session',
-            origin: target.origin,
-            reason: access.reason,
-            itemId: result.connectionId,
-            itemKind: 'session',
-            ...(access.basis ? { basis: access.basis } : {}),
-          });
-        return result;
       },
       speech,
       audioReplies: async () => (await speechPreferences.get()).speechReply,
@@ -2976,16 +2956,18 @@ async function initializeApplication(
           );
         return personal.manage(action, args, source);
       },
-      requestPayment: async (turn, input, show) => {
+      requestPayment: async (turn, input, show, admit) => {
+        await admit?.(true);
         const { image, ...result } = await payments.request(turn, input);
         await show(image);
         return result;
       },
-      requestCredential: async (turn, input) => {
+      requestCredential: async (turn, input, admit) => {
         if (input.kind === 'method') {
           const origin = credentialOrigin(input.origin);
-          const access = await permitVault(turn, { origin, kind: 'sign_in' });
+          const access = await permitVault(turn, { origin, kind: 'sign_in' }, admit);
           if ('question' in access) return { [appConfirmation]: access.question };
+          await admit?.(true);
           return vault.request(turn, ownerId, {
             origin,
             label: input.label,
@@ -2998,12 +2980,16 @@ async function initializeApplication(
         if (request.kind === 'otp' && !request.emailCode) {
           const login = await vault.authenticatorLogin(turn, ownerId, origin, savedLoginId);
           if (login) {
-            const access = await permitVault(turn, {
-              origin,
-              kind: 'sign_in',
-              itemId: login.id,
-              account: [login.label, login.usernameHint].filter(Boolean).join(' · '),
-            });
+            const access = await permitVault(
+              turn,
+              {
+                origin,
+                kind: 'sign_in',
+                itemId: login.id,
+                account: [login.label, login.usernameHint].filter(Boolean).join(' · '),
+              },
+              admit,
+            );
             if ('question' in access) return { [appConfirmation]: access.question };
             if (await vault.fillAuthenticatorCode(turn, ownerId, login.id, request)) {
               await vaultAccess.record(turn, {
@@ -3026,24 +3012,32 @@ async function initializeApplication(
             : saved.length === 1
               ? saved[0]
               : undefined;
-        const access = await permitVault(turn, {
-          origin,
-          kind:
-            request.kind === 'otp'
-              ? request.emailCode
-                ? 'sign_in'
-                : 'form'
-              : chosen
-                ? 'sign_in'
-                : 'form',
-          ...(chosen
-            ? {
-                itemId: chosen.id,
-                account: [chosen.label, chosen.usernameHint].filter(Boolean).join(' · '),
-              }
-            : {}),
-        });
+        const access = await permitVault(
+          turn,
+          {
+            origin,
+            kind:
+              request.kind === 'otp'
+                ? request.emailCode
+                  ? 'sign_in'
+                  : 'form'
+                : chosen
+                  ? 'sign_in'
+                  : 'form',
+            ...(chosen
+              ? {
+                  itemId: chosen.id,
+                  account: [chosen.label, chosen.usernameHint].filter(Boolean).join(' · '),
+                }
+              : {}),
+          },
+          admit,
+        );
         if ('question' in access) return { [appConfirmation]: access.question };
+        const ask = async (entry: typeof request) => {
+          await admit?.(true);
+          return vault.request(turn, ownerId, entry);
+        };
         const filled = async (itemId?: string) => {
           await vaultAccess.record(turn, {
             action: request.kind === 'otp' ? 'code' : 'sign_in',
@@ -3055,19 +3049,17 @@ async function initializeApplication(
           return { filled: true as const };
         };
         if (request.kind === 'otp')
-          return (await vault.fillEmailCode(turn, ownerId, request))
-            ? filled()
-            : vault.request(turn, ownerId, request);
+          return (await vault.fillEmailCode(turn, ownerId, request)) ? filled() : ask(request);
         if (savedLoginId !== undefined)
           return (await vault.fillSaved(turn, ownerId, savedLoginId, request))
             ? filled(savedLoginId)
-            : vault.request(turn, ownerId, request);
+            : ask(request);
         const selected = await vault.fillSelected(turn, ownerId, request);
         if (selected) return filled();
         if (selected === undefined && chosen) {
           if (await vault.fillSaved(turn, ownerId, chosen.id, request)) return filled(chosen.id);
         }
-        return vault.request(turn, ownerId, request);
+        return ask(request);
       },
       localFiles: localFiles.available,
       computerUse: computerUse.available,
@@ -3471,7 +3463,6 @@ async function initializeApplication(
   vault.registerRoutes(app);
   payments.registerRoutes(app);
   vaultAccess.registerRoutes(app);
-  browserConnections.registerRoutes(app);
   adapters.integrationBrowser?.registerRoutes(app);
   integrations.registerRoutes(app);
   localFiles.registerRoutes(app);

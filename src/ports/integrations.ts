@@ -11,6 +11,7 @@ export interface IntegrationConnectionBrowser {
       origin: string,
       native?: { returnPath: string },
     ) => Promise<string>,
+    app?: string,
   ): Promise<string>;
   owns(url: string): boolean;
   remote(url: string): string | undefined;
@@ -28,7 +29,6 @@ export type ConnectedApp = Pick<
   | 'supportsTriggers'
   | 'triggersEnabled'
   | 'triggerStatus'
-  | 'browserState'
   | 'checkedAt'
 > & { access: Array<'api' | 'http' | 'mcp' | 'browser' | 'cli'> };
 export interface IntegrationFile {

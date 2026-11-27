@@ -109,7 +109,7 @@ type AnalyticsEvents = {
   };
   app_connect_clicked: {
     entry: 'apps' | 'chat' | 'onboarding' | 'manage';
-    result: 'opened' | 'needs_access_setup';
+    result: 'opened' | 'needs_access_setup' | 'channels';
   };
   model_selected: {
     provider: ModelProvider | 'other';
@@ -153,6 +153,11 @@ const presentationKinds = [
   'chart',
   'apps',
   'diagram',
+  'items',
+  'schedule',
+  'facts',
+  'compare',
+  'draft',
 ];
 const artifactKinds = [
   'image',
@@ -262,7 +267,7 @@ const eventProperties: Record<keyof AnalyticsEvents, Record<string, readonly unk
   },
   app_connect_clicked: {
     entry: ['apps', 'chat', 'onboarding', 'manage'],
-    result: ['opened', 'needs_access_setup'],
+    result: ['opened', 'needs_access_setup', 'channels'],
   },
   model_selected: {
     provider: [...modelProviders, 'other'],
