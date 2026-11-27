@@ -234,6 +234,7 @@ interface SubmitUserMessageOptions {
   seenMessageId?: string;
   clientMessageId?: string;
   questionAnswer?: QuestionAnswer;
+  cardChoice?: boolean;
   approvalAnswer?: { approvalId: string; approved: boolean };
   audioCaption?: string;
   prompt?: string;
@@ -900,7 +901,7 @@ export async function submitUserMessage(
     if (options.clientMessageId) {
       const previous = (
         await client.query(
-          'SELECT id,owner_id,role,text,display_text,audio_caption,thread_id,turn_id,attachments,reply_to_message_id,reply_quote,question_answer,approval_answer,(SELECT a.id FROM approvals a WHERE a.execution_turn_id=messages.turn_id AND a.owner_id=messages.owner_id LIMIT 1) AS approval_id FROM messages WHERE id=$1',
+          'SELECT id,owner_id,role,text,display_text,audio_caption,thread_id,turn_id,attachments,reply_to_message_id,reply_quote,question_answer,card_choice,approval_answer,(SELECT a.id FROM approvals a WHERE a.execution_turn_id=messages.turn_id AND a.owner_id=messages.owner_id LIMIT 1) AS approval_id FROM messages WHERE id=$1',
           [options.clientMessageId],
         )
       ).rows[0];
@@ -916,6 +917,7 @@ export async function submitUserMessage(
           previous.reply_quote !== (options.replyQuote ?? null) ||
           JSON.stringify(previous.question_answer) !==
             JSON.stringify(options.questionAnswer ?? null) ||
+          Boolean(previous.card_choice) !== Boolean(options.cardChoice) ||
           previous.approval_answer !== (options.approvalAnswer?.approved ?? null) ||
           (options.approvalAnswer && previous.approval_id !== options.approvalAnswer.approvalId) ||
           JSON.stringify((previous.attachments as Artifact[]).map((item) => item.id)) !==
@@ -1070,7 +1072,7 @@ export async function submitUserMessage(
     }
     const prepared = (await options.prepareAttachments?.(client, thread.id)) ?? [];
     await client.query(
-      "INSERT INTO messages(id,owner_id,role,text,display_text,thread_id,turn_id,attachments,reply_to_message_id,reply_quote,audio_caption,question_answer) VALUES($1,$2,'user',$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+      "INSERT INTO messages(id,owner_id,role,text,display_text,thread_id,turn_id,attachments,reply_to_message_id,reply_quote,audio_caption,question_answer,card_choice) VALUES($1,$2,'user',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
       [
         messageId,
         ownerId,
@@ -1083,6 +1085,7 @@ export async function submitUserMessage(
         options.replyQuote ?? null,
         options.audioCaption ?? null,
         options.questionAnswer ? JSON.stringify(options.questionAnswer) : null,
+        options.cardChoice === true,
       ],
     );
     if (live) await sendDrain(client, thread.id, startAfter ?? undefined);

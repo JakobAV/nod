@@ -1011,7 +1011,8 @@ export function Chat({
       message.role === 'user' &&
       message.replyTo?.role === 'assistant' &&
       !cardChoices.has(message.replyTo.id) &&
-      cardOptionTexts.get(message.replyTo.id)?.has(message.text)
+      cardOptionTexts.has(message.replyTo.id) &&
+      (message.cardChoice || cardOptionTexts.get(message.replyTo.id)!.has(message.text))
     )
       cardChoices.set(message.replyTo.id, message.text);
   const lastOwnerIndex = visibleMessages.findLastIndex((message) => message.role === 'user');
@@ -1370,6 +1371,8 @@ export function Chat({
         state.pendingAnswerChoiceMessageIds?.includes(reply.id))
         ? { custom: true }
         : undefined;
+    const cardChoice =
+      source === 'answer_choice' && !questionAnswer && !approvalAnswer && Boolean(replyId);
     const directAnswer = source === 'answer_choice' || source === 'approval_card';
     const captureAnalytics = analyticsForCurrentSession();
     const sentThread = threadId;
@@ -1484,6 +1487,7 @@ export function Chat({
       ...((questionAnswer || approvalAnswer) && value.trim() && !attachments.length && !recording
         ? { cardAnswer: true as const }
         : {}),
+      ...(cardChoice ? { cardChoice: true as const } : {}),
       ...(reply
         ? {
             replyToMessageId: reply.id,
@@ -1591,6 +1595,7 @@ export function Chat({
           ...(seenMessageId ? { seenMessageId } : {}),
           ...(verificationRequestId ? { verificationRequestId } : {}),
           ...(questionAnswer ? { questionAnswer } : {}),
+          ...(cardChoice ? { cardChoice: true } : {}),
           ...(approvalAnswer ? { approvalAnswer } : {}),
         });
       submittedBody = messageBody;
