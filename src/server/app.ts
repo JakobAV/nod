@@ -73,6 +73,7 @@ import { createCardInteractions } from './card-interactions.ts';
 
 const messageFields = `m.id,m.role,m.text,CASE WHEN m.role='user' THEN m.display_text END AS "displayText",m.audio_caption AS "audioCaption",m.turn_id AS "turnId",m.created_at AS "createdAt",m.attachments,m.stream_id AS "streamId",m.reaction,m.assistant_reaction AS "assistantReaction",m.reply_to_message_id AS "replyToMessageId",m.suggestions,m.presentation,m.answer_choices AS "answerChoices",(${pendingAnswerChoicesSql}) AS "answerChoicesPending",
  (m.role='user' AND (m.approval_answer IS NOT NULL OR (m.question_answer IS NOT NULL AND m.text<>'' AND jsonb_array_length(m.attachments)=0))) AS "cardAnswer",
+ (m.role='user' AND m.card_choice) AS "cardChoice",
  CASE WHEN m.role='assistant' AND m.answer_choices IS NOT NULL THEN (SELECT json_build_object('answer',a.question_answer,'text',a.text) FROM messages a
    WHERE a.reply_to_message_id=m.id AND a.owner_id=m.owner_id AND a.role='user' AND a.question_answer IS NOT NULL AND a.text<>'' AND jsonb_array_length(a.attachments)=0 ORDER BY a.created_at,a.id LIMIT 1) END AS "choiceAnswer",
  CASE WHEN m.role='assistant' THEN (SELECT json_build_object('id',ci.id,'status',ci.status,'selectedOptionIds',ci.selected_option_ids,'validUntil',ci.valid_until) FROM card_interactions ci
@@ -168,7 +169,7 @@ type InteractionRow = {
 
 type MessageRow = Omit<
   Message,
-  'approval' | 'choiceAnswer' | 'cardAnswer' | 'work' | 'interaction'
+  'approval' | 'choiceAnswer' | 'cardAnswer' | 'cardChoice' | 'work' | 'interaction'
 > & {
   work?: Message['work'] | null;
   assistantReaction?: MessageReaction | null;
@@ -176,6 +177,7 @@ type MessageRow = Omit<
   choiceAnswer?: ChoiceAnswerRow | null;
   interaction?: InteractionRow | null;
   cardAnswer?: boolean | null;
+  cardChoice?: boolean | null;
   retryable?: boolean | null;
 };
 
@@ -191,6 +193,7 @@ function messageView(row: MessageRow): Message {
     choiceAnswer,
     interaction,
     cardAnswer,
+    cardChoice,
     retryable,
     work,
     ...message
@@ -238,6 +241,7 @@ function messageView(row: MessageRow): Message {
         }
       : {}),
     ...(cardAnswer ? { cardAnswer: true as const } : {}),
+    ...(cardChoice ? { cardChoice: true as const } : {}),
     ...(retryable ? { retryable: true } : {}),
     ...(work ? { work } : {}),
     reactions: [
@@ -688,6 +692,15 @@ export async function createApp(dependencies: AppDependencies = {}) {
             !value.verificationRequestId &&
             value.attachmentIds.length === 0),
       )
+      .refine(
+        (value) =>
+          !value.cardChoice ||
+          (Boolean(value.replyToMessageId) &&
+            !value.questionAnswer &&
+            !value.approvalAnswer &&
+            !value.verificationRequestId &&
+            value.attachmentIds.length === 0),
+      )
       .parse(request.body);
     const clientMessageId = input.clientMessageId ?? randomUUID();
     if (
@@ -744,6 +757,7 @@ export async function createApp(dependencies: AppDependencies = {}) {
         chatClearedAt: input.chatClearedAt,
         clientMessageId,
         questionAnswer: input.questionAnswer,
+        cardChoice: input.cardChoice,
         approvalAnswer: input.approvalAnswer,
         stopSignal: arrival,
       },

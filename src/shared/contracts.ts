@@ -46,6 +46,7 @@ export interface Message {
   };
   approval?: MessageApproval;
   cardAnswer?: true;
+  cardChoice?: true;
   retryable?: boolean;
   work?: { kind: 'task' | 'schedule'; id: string; title: string; turnId?: string };
 }
