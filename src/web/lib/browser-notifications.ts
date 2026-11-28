@@ -199,7 +199,12 @@ async function showNotification(
   keep: () => boolean,
   onclick?: () => void,
 ) {
-  const options = { silent: true, body, icon: new URL('/nod-logo.png', window.location.origin).href, tag };
+  const options = {
+    silent: true,
+    body,
+    icon: new URL('/nod-logo.png', window.location.origin).href,
+    tag,
+  };
   try {
     const notification = new window.Notification('Nod', options);
     notification.onshow = () => {
