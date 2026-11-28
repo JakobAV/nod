@@ -5,6 +5,7 @@ import { dirname, isAbsolute, resolve } from 'node:path';
 
 const preferenceFields = ['launchAtLogin', 'notifications'];
 const onboardingPreferenceSteps = ['notifications', 'launchAtLogin', 'complete'];
+const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 export function desktopContentPolicy(posthogHost) {
   return `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data: blob:; font-src 'self' data:; connect-src 'self' ${new URL(posthogHost).origin}; media-src 'self' https: data: blob:; frame-src 'self' blob: data: https://www.openstreetmap.org; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`;
@@ -125,6 +126,7 @@ export function createSettingsStore(path, encryption, platform = process.platfor
         ![1, 2].includes(value.version) ||
         !['system', 'light', 'dark'].includes(value.theme) ||
         preferenceFields.some((field) => typeof value[field] !== 'boolean') ||
+        (value.notificationSound !== undefined && typeof value.notificationSound !== 'boolean') ||
         (value.version === 1
           ? typeof value.onboardingCompleted !== 'boolean'
           : value.onboardingCompleted !== undefined) ||
@@ -139,6 +141,11 @@ export function createSettingsStore(path, encryption, platform = process.platfor
             resolve(value.computerDirectory) !== value.computerDirectory)) ||
         (value.onboardingPreferenceStep !== undefined &&
           !onboardingPreferenceSteps.includes(value.onboardingPreferenceStep)) ||
+        (value.keepAwake !== undefined && typeof value.keepAwake !== 'boolean') ||
+        (value.keptOnNotice !== undefined && value.keptOnNotice !== true) ||
+        (value.announcedPackageVersion !== undefined &&
+          (typeof value.announcedPackageVersion !== 'string' ||
+            !versionPattern.test(value.announcedPackageVersion))) ||
         (value.serverUrl !== undefined &&
           (serverOrigin(value.serverUrl) !== value.serverUrl || !value.secrets.serverToken)) ||
         (value.welcome !== undefined &&
@@ -256,6 +263,8 @@ export function createSettingsStore(path, encryption, platform = process.platfor
     return {
       launchAtLogin: value.launchAtLogin,
       notifications: value.notifications,
+      notificationSound: value.notificationSound === true,
+      keepAwake: value.keepAwake ?? true,
       theme: value.theme,
       zoomFactor: value.zoomFactor ?? 1,
       ...(value.serverUrl ? { serverUrl: value.serverUrl } : {}),
@@ -270,6 +279,16 @@ export function createSettingsStore(path, encryption, platform = process.platfor
     },
     computerDirectory() {
       return exclusive(async () => (await read()).computerDirectory);
+    },
+    announcedPackageVersion() {
+      return exclusive(async () => (await read()).announcedPackageVersion);
+    },
+    saveAnnouncedPackageVersion(version) {
+      return exclusive(async () => {
+        if (typeof version !== 'string' || !versionPattern.test(version))
+          throw new Error('The announced update version is invalid.');
+        await write({ ...(await read()), announcedPackageVersion: version });
+      });
     },
     hasSavedKeys() {
       return exclusive(async () => Object.keys((await read()).secrets).length > 0);
@@ -327,6 +346,8 @@ export function createSettingsStore(path, encryption, platform = process.platfor
                 'zoomFactor',
                 'computerDirectory',
                 ...preferenceFields,
+                'notificationSound',
+                'keepAwake',
                 'onboardingPreferenceStep',
                 'welcome',
               ].includes(key),
@@ -376,10 +397,14 @@ export function createSettingsStore(path, encryption, platform = process.platfor
             throw new Error('Welcome has already finished or its choices are invalid.');
           value.welcome = { ...input.welcome };
         }
-        for (const field of preferenceFields) {
+        for (const field of [...preferenceFields, 'notificationSound']) {
           if (input[field] === undefined) continue;
           if (typeof input[field] !== 'boolean') throw new Error('Check your preferences.');
           value[field] = input[field];
+        }
+        if (input.keepAwake !== undefined) {
+          if (typeof input.keepAwake !== 'boolean') throw new Error('Check your preferences.');
+          value.keepAwake = input.keepAwake;
         }
         if (input.onboardingPreferenceStep !== undefined) {
           if (input.onboardingPreferenceStep !== 'complete')
@@ -389,6 +414,15 @@ export function createSettingsStore(path, encryption, platform = process.platfor
         if (value.onboardingPreferenceStep === 'complete') delete value.welcome;
         await write(value);
         return redacted(value);
+      });
+    },
+    keptOnNoticeShown() {
+      return exclusive(async () => (await read()).keptOnNotice === true);
+    },
+    saveKeptOnNotice() {
+      return exclusive(async () => {
+        const value = await read();
+        if (!value.keptOnNotice) await write({ ...value, keptOnNotice: true });
       });
     },
     acknowledgeWelcome(expected) {
